@@ -1,0 +1,258 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tobific <tobific@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH 2/8] seam: required tool policy with unload-proof lifetime
+ (experimental)
+
+Adds agent/required_tool_policy.py and PluginContext.register_required_tool_policy.
+A leased, task-local policy is checked at every tool dispatch point
+(model_tools, tools/registry, plugin dispatch) after argument rewrites, and
+stays binding until revoked, even if the plugin unloads. Used by the
+orchestrator's task_authority to enforce per-task permissions.
+
+Experimental, built against Hermes 8a3ede1b.
+---
+ agent/required_tool_policy.py  | 76 ++++++++++++++++++++++++++++++++++
+ hermes_cli/plugins.py          | 16 +++++++
+ hermes_cli/plugins_dispatch.py |  8 ++++
+ model_tools.py                 | 31 ++++++++++++++
+ tools/registry.py              | 19 ++++++++-
+ 5 files changed, 149 insertions(+), 1 deletion(-)
+ create mode 100644 agent/required_tool_policy.py
+
+diff --git a/agent/required_tool_policy.py b/agent/required_tool_policy.py
+new file mode 100644
+index 0000000000..9a95dd9adf
+--- /dev/null
++++ b/agent/required_tool_policy.py
+@@ -0,0 +1,76 @@
++"""Opt-in task-local tool policy leases, independent of optional hook lookup.
++
++A captured scope retains every required policy until it exits. Revocation is
++shared across copied thread contexts and never turns a required scope into an
++unrestricted one. Already admitted effects may finish; subsequent admissions
++fail closed. This is cooperative host dispatch policy, not a Python sandbox.
++"""
++
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from copy import deepcopy
++import inspect
++from threading import Event
++from types import MappingProxyType
++from typing import Callable, Iterator, Mapping
++
++_REQUIRED: ContextVar[tuple["RequiredToolPolicy", ...]] = ContextVar(
++    "required_tool_policies", default=()
++)
++_DENIED = "Required tool policy denied this invocation"
++
++
++class RequiredToolPolicy:
++    """One registration generation. Unloading revokes this exact object."""
++
++    def __init__(self, check: Callable[[str, Mapping], bool]):
++        if not callable(check) or inspect.iscoroutinefunction(check):
++            raise TypeError("Required tool policy must be a synchronous callable")
++        self._check = check
++        self._revoked = Event()
++
++    def revoke(self) -> None:
++        self._revoked.set()
++
++    @contextmanager
++    def scope(self) -> Iterator[None]:
++        # Conjunction, never replacement: a nested generation cannot erase its
++        # parent's lifetime constraint, including an already revoked parent.
++        token = _REQUIRED.set(_REQUIRED.get() + (self,))
++        try:
++            yield
++        finally:
++            _REQUIRED.reset(token)
++
++
++def required_policy_error(name: str, args: dict) -> str | None:
++    """Check the captured generations, never a current plugin-name lookup.
++
++    Call at ingress and again immediately before handler admission, after all
++    ordinary argument rewriting. Validators must be bounded and side-effect-free.
++    Give each validator a detached argument view so it cannot rewrite the call.
++    """
++    policies = _REQUIRED.get()
++    if not policies:
++        return None
++    try:
++        for policy in policies:
++            if policy._revoked.is_set():
++                return _DENIED
++            result = policy._check(name, MappingProxyType(deepcopy(args)))
++            if inspect.isawaitable(result):
++                close = getattr(result, "close", None)
++                if callable(close):
++                    close()
++                return _DENIED
++            if result is not True or policy._revoked.is_set():
++                return _DENIED
++        # A later validator may revoke an earlier one. All captured generations
++        # must still be live at this admission's final check.
++        if any(policy._revoked.is_set() for policy in policies):
++            return _DENIED
++    except Exception:
++        return _DENIED
++    return None
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 8805d2974b..7e007ea573 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -928,6 +928,22 @@ class PluginContext(ServiceTierPluginContextMixin):
+         logger.debug("Plugin %s registered %d redaction pattern(s)", self.manifest.name, count)
+         return count
+ 
++    def register_required_tool_policy(self, callback: Callable):
++        """Lease an opt-in task-local policy independent of optional hooks.
++
++        Bind the returned object's ``scope()`` around the entire trusted worker
++        execution. Unload revokes the captured generation; reload cannot revive
++        old scopes. Validators return literal True to admit, otherwise deny.
++        """
++        from agent.required_tool_policy import RequiredToolPolicy
++
++        policy = RequiredToolPolicy(callback)
++        self._track(
++            "required_tool_policy",
++            getattr(callback, "__name__", "policy"),
++            policy.revoke,
++        )
++        return policy
+     def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
+         """Register a lifecycle hook callback (unknown names warn but are still stored)."""
+         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
+diff --git a/hermes_cli/plugins_dispatch.py b/hermes_cli/plugins_dispatch.py
+index 78c3927fc4..2d3f0787ae 100644
+--- a/hermes_cli/plugins_dispatch.py
++++ b/hermes_cli/plugins_dispatch.py
+@@ -203,6 +203,14 @@ class PluginDispatchMixin:
+         are (loop-safe), otherwise the bare coroutine object is appended to the results and the
+         plugin's body never runs (#12449).
+         """
++        from agent.required_tool_policy import required_policy_error
++
++        if isinstance(payload.get("tool_name"), str) and isinstance(
++            payload.get("args"), dict
++        ):
++            policy_error = required_policy_error(payload["tool_name"], payload["args"])
++            if policy_error is not None:
++                return {"action": "block", "message": policy_error}
+         from hermes_cli.plugins import resolve_plugin_command_result
+         return resolve_plugin_command_result(callback(**cls._hook_callback_kwargs(callback, payload)))
+ 
+diff --git a/model_tools.py b/model_tools.py
+index 55f8de5bfd..909438e658 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -787,6 +787,16 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
+         if block_message is not None:
+             return function_args, (tool_error(block_message), "plugin_block", block_message)
+ 
++    from agent.required_tool_policy import required_policy_error
++
++    policy_error = required_policy_error(function_name, function_args)
++    if policy_error is not None:
++        return function_args, (
++            tool_error(policy_error, error_type="required_tool_policy"),
++            "required_tool_policy",
++            policy_error,
++        )
++
+     # ACP/Zed edit approval before any file mutation. The requester is bound
+     # via ContextVar only for ACP sessions, so CLI/gateway paths are unaffected.
+     try:
+@@ -833,6 +843,11 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
+         dispatch_kwargs["user_task"] = user_task
+ 
+     def _dispatch(next_args: Dict[str, Any]) -> Any:
++        from agent.required_tool_policy import required_policy_error
++
++        policy_error = required_policy_error(function_name, next_args)
++        if policy_error is not None:
++            return tool_error(policy_error, error_type="required_tool_policy")
+         from tools.connectors import dispatch_connector_call, is_connector_name
+         if is_connector_name(function_name):
+             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
+@@ -889,6 +904,9 @@ def handle_function_call(
+     function_args = coerce_tool_args(function_name, function_args)
+     if not isinstance(function_args, dict):
+         function_args = {}
++    from agent.required_tool_policy import required_policy_error
++
++    ingress_policy_error = required_policy_error(function_name, function_args)
+     trace = list(tool_request_middleware_trace or [])
+     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
+     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
+@@ -900,6 +918,15 @@ def handle_function_call(
+                                   **asdict(ids), middleware_trace=list(trace), **extra)
+         return result
+ 
++    def _policy_denied(message: str) -> Any:
++        # DC-02 x upstream 8b0c3da8c0: a required-policy denial is observed like every other
++        # blocked outcome, exactly once (the executor suppresses this inner observer when it owns the emission).
++        return _emit(tool_error(message, error_type="required_tool_policy"), status="blocked",
++                     error_type="required_tool_policy", error_message=message)
++
++    if ingress_policy_error is not None:
++        return _policy_denied(ingress_policy_error)
++
+     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
+     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
+     # approval, guardrails) sees the real tool name, never the bridge.
+@@ -934,6 +961,10 @@ def handle_function_call(
+     if not skip_tool_request_middleware:
+         function_args, original_args, trace = _apply_request_middleware(function_name, function_args, ids, trace)
+ 
++    policy_error = required_policy_error(function_name, function_args)
++    if policy_error is not None:
++        return _policy_denied(policy_error)
++
+     try:
+         if function_name in _AGENT_LOOP_TOOLS:
+             return tool_error(f"{function_name} must be handled by the agent loop")
+diff --git a/tools/registry.py b/tools/registry.py
+index 57cffdc89a..dae12bcc5b 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -894,6 +894,11 @@ class ToolRegistry:
+         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
+         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
+         results normalized, every exception returned as ``{"error": ...}``."""
++        from agent.required_tool_policy import required_policy_error
++
++        policy_error = required_policy_error(name, args)
++        if policy_error is not None:
++            return tool_error(policy_error, error_type="required_tool_policy")
+         entry = self.get_entry(name, scope=scope)
+         if not entry:
+             return tool_error(f"Unknown tool: {name}")
+@@ -904,8 +909,20 @@ class ToolRegistry:
+             kwargs = _kwargs_accepted_by(entry.handler, kwargs)
+             if entry.is_async:
+                 from model_tools import _run_async
+-                result = _run_async(entry.handler(args, **kwargs))
++
++                async def invoke_guarded():
++                    policy_error = required_policy_error(name, args)
++                    if policy_error is not None:
++                        return tool_error(
++                            policy_error, error_type="required_tool_policy"
++                        )
++                    return await entry.handler(args, **kwargs)
++
++                result = _run_async(invoke_guarded())
+             else:
++                policy_error = required_policy_error(name, args)
++                if policy_error is not None:
++                    return tool_error(policy_error, error_type="required_tool_policy")
+                 result = entry.handler(args, **kwargs)
+             return self._normalize_handler_result(name, result)
+         except Exception as e:

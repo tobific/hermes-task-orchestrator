@@ -1,0 +1,760 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tobific <tobific@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH 3/8] seam: trusted completion fence for async delegation
+ (experimental)
+
+tools/async_delegation.py: a plugin-registered guard validates a
+"completion_fence" before a background completion is delivered, including
+orphan replay after restart; the gateway passes the fence when it claims a
+completion. Prevents delivery of stale or unreviewed results.
+
+Experimental, built against Hermes 8a3ede1b.
+---
+ gateway/run_notifications.py |  10 +-
+ tools/async_delegation.py    | 597 +++++++++++++++++++++++++++++++----
+ 2 files changed, 546 insertions(+), 61 deletions(-)
+
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+index 21d50135be..48fda72747 100644
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -1537,7 +1537,15 @@ class GatewayNotificationsMixin:
+                 try:
+                     from tools.async_delegation import claim_completion_delivery
+                     claim.claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+-                    if not claim_completion_delivery(claim.delegation_id, claim.claim_id):
++                    if not claim_completion_delivery(
++                        claim.delegation_id,
++                        claim.claim_id,
++                        **(
++                            {"completion_fence": evt["completion_fence"]}
++                            if "completion_fence" in evt
++                            else {}
++                        ),
++                    ):
+                         claim.proceed = False
+                         return claim
+                 except Exception as exc:
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index 85cec62b31..e4900ce5b2 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -17,8 +17,10 @@ import sqlite3
+ import threading
+ import time
+ import uuid
++from contextvars import ContextVar
++from contextlib import contextmanager, nullcontext
+ from concurrent.futures import ThreadPoolExecutor
+-from typing import Any, Callable, Dict, List, Optional
++from typing import Any, Callable, Dict, Iterator, List, Optional
+ 
+ from hermes_constants import get_hermes_home, hermes_home_key
+ from tools.daemon_pool import DaemonThreadPoolExecutor
+@@ -66,6 +68,133 @@ _offered: set = set()
+ _last_orphan_sweep: Dict[str, float] = {}
+ 
+ # ── Stale-delegation detection (progress-based, on by default) ──────────────
++# Optional host-owned completion fence. The default is deliberately absent:
++# callers which never register a fence retain the legacy missing-row behavior.
++# A context-local value is captured by a dispatch record, while the process
++# default lets a host plugin validate rows restored or claimed after restart.
++_completion_guard_var: ContextVar[Any] = ContextVar(
++    "async_completion_guard", default=None
++)
++_completion_guard_lock = threading.RLock()
++_completion_guard_default: Any = None
++
++
++class _CompletionGuardRegistration:
++    """Context manager used by host integrations to register a fence provider."""
++
++    def __init__(self, provider: Any):
++        self.provider = provider
++        self._token = None
++
++    def __enter__(self):
++        self._token = _completion_guard_var.set(self.provider)
++        return self.provider
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        _completion_guard_var.reset(self._token)
++        return False
++
++
++def register_completion_guard(provider: Any) -> _CompletionGuardRegistration:
++    """Return a context manager for a host-owned completion fence provider.
++
++    A provider must expose ``lock`` (a reentrant durable-lock context manager),
++    ``stamp`` and ``validate``. Validation is never consulted for unmarked
++    legacy events.
++    """
++    if provider is not None and not all(
++        callable(getattr(provider, name, None))
++        for name in ("lock", "stamp", "validate")
++    ):
++        raise TypeError("completion guard must provide lock, stamp and validate")
++    return _CompletionGuardRegistration(provider)
++
++
++def set_completion_guard(provider: Any) -> None:
++    """Install a live provider for this profile, never an identifier history."""
++    if provider is not None and not all(
++        callable(getattr(provider, n, None)) for n in ("lock", "validate")
++    ):
++        raise TypeError("completion guard must provide lock and validate")
++    from hermes_constants import get_hermes_home
++
++    key = str(get_hermes_home().resolve())
++    global _completion_guard_default
++    with _completion_guard_lock:
++        if not isinstance(_completion_guard_default, dict):
++            _completion_guard_default = {}
++        if provider is None:
++            _completion_guard_default.pop(key, None)
++        else:
++            _completion_guard_default[key] = provider
++
++
++def _completion_guard_for(record: Optional[Dict[str, Any]] = None) -> Any:
++    if record is not None:
++        return record.get("_completion_guard")
++    current = _completion_guard_var.get()
++    if current is not None:
++        return current
++    from hermes_constants import get_hermes_home
++
++    key = str(get_hermes_home().resolve())
++    with _completion_guard_lock:
++        return (_completion_guard_default or {}).get(key)
++
++
++def _completion_guard_context(provider: Any):
++    if provider is None:
++        return nullcontext()
++    context = provider.lock()
++    if not hasattr(context, "__enter__") or not hasattr(context, "__exit__"):
++        raise TypeError("completion guard lock must return a context manager")
++    return context
++
++
++def _guard_validate(provider: Any, marker: Any, delegation_id: str) -> Optional[bool]:
++    if provider is None:
++        return None
++    if not isinstance(marker, dict):
++        return False
++    try:
++        return provider.validate(marker, delegation_id) is True
++    except Exception:
++        logger.warning(
++            "Async completion fence validation unavailable for %s",
++            delegation_id,
++            exc_info=True,
++        )
++        return None
++
++
++def _guard_stamp(provider: Any, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
++    if provider is None:
++        return None
++    marker = provider.stamp(record)
++    if not isinstance(marker, dict):
++        raise TypeError("completion guard stamp must return an object")
++    return marker
++
++
++def _guard_prepare(provider: Any, marker: Dict[str, Any], delegation_id: str):
++    """Give a provider one chance to add its current review snapshot."""
++    prepare = getattr(provider, "prepare", None)
++    if not callable(prepare):
++        return marker
++    try:
++        prepared = prepare(marker, delegation_id)
++    except Exception:
++        logger.warning(
++            "Async completion fence preparation failed for %s",
++            delegation_id,
++            exc_info=True,
++        )
++        return None
++    if prepared is None or not isinstance(prepared, dict):
++        return None
++    return prepared
++
++
+ # A runner wedged before returning never reaches its finalizer, so it would show
+ # "dispatched" forever. No wall-clock timeout (heavy work must never be killed for
+ # taking long): one monitor thread samples per-dispatch PROGRESS via an injected
+@@ -163,7 +292,10 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
+         task_payload["owner_cwd"] = os.getcwd()
+     except OSError:
+         pass
+-    with _DB_LOCK, _transaction() as conn:
++    if "_completion_fence" in record:
++        task_payload["completion_fence"] = record["_completion_fence"]
++    guard = _completion_guard_for(record)
++    with _completion_guard_context(guard), _DB_LOCK, _transaction() as conn:
+         conn.execute("""INSERT OR REPLACE INTO async_delegations
+                (delegation_id, origin_session, origin_ui_session_id,
+                 parent_session_id, state, dispatched_at, updated_at,
+@@ -201,14 +333,52 @@ def _prune_durable_records() -> None:
+                    )""", (pending_count - _MAX_DURABLE_PENDING,))
+ 
+ 
+-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
++def _persist_completion(
++    event: Dict[str, Any], result: Dict[str, Any], *, delivery_state: str = "pending"
++) -> bool:
++    if delivery_state not in {"pending", "dropped"}:
++        raise ValueError("invalid completion delivery state")
+     now = time.time()
++    guarded = "completion_fence" in event
+     with _DB_LOCK, _transaction() as conn:
+-        conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+-               event_json=?, result_json=?, delivery_state='pending'
+-               WHERE delegation_id=?""",
+-            (event.get("status", "completed"), event.get("completed_at", now), now,
+-             json.dumps(event), json.dumps(result), event["delegation_id"]))
++        task_json = None
++        effective = delivery_state
++        if guarded:
++            if not conn.in_transaction:
++                conn.execute("BEGIN IMMEDIATE")
++            current = conn.execute(
++                "SELECT task_json, delivery_state, event_json FROM async_delegations WHERE delegation_id=?",
++                (event["delegation_id"],),
++            ).fetchone()
++            if current is None or current[2] is not None:
++                return False
++            if current[1] != "pending":
++                effective = "dropped"
++            try:
++                task_payload = json.loads(current[0] or "{}")
++            except (TypeError, ValueError):
++                task_payload = None
++            if not isinstance(task_payload, dict):
++                effective = "dropped"
++            else:
++                task_payload["completion_fence"] = event["completion_fence"]
++                task_json = json.dumps(task_payload)
++        conn.execute(
++            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
++            event_json=?, result_json=?, task_json=COALESCE(?, task_json), delivery_state=?
++            WHERE delegation_id=?""",
++            (
++                event.get("status", "completed"),
++                event.get("completed_at", now),
++                now,
++                json.dumps(event),
++                json.dumps(result),
++                task_json,
++                effective,
++                event["delegation_id"],
++            ),
++        )
++        return effective == "pending"
+ 
+ 
+ def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
+@@ -295,30 +465,32 @@ def recover_abandoned_delegations() -> int:
+                 "status": "unknown", "summary": None, "error": error, **diagnostics,
+                 **({"results": recovered_results} if recovered_results else {}),
+                 "dispatched_at": dispatched_at, "completed_at": now,
+-                **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
++                **{k: task[k] for k in _ROUTING_KEYS if task.get(k)},
++                **({"completion_fence": task["completion_fence"]} if "completion_fence" in task else {})}
+             result = {"status": "unknown", "summary": None, "error": event["error"], **diagnostics,
+                       **({"results": recovered_results} if recovered_results else {})}
+-            conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
+-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+-                   WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
++            if "completion_fence" in task:
++                event = _as_native_notice(event)
++                task["completion_fence"] = event["completion_fence"]
++            conn.execute(
++                """UPDATE async_delegations SET state='unknown', completed_at=?,
++                   updated_at=?, event_json=?, result_json=?, task_json=?, delivery_state='pending'
++                   WHERE delegation_id=?""",
++                (
++                    now,
++                    now,
++                    json.dumps(event),
++                    json.dumps(result),
++                    json.dumps(task) if "completion_fence" in task else task_json,
++                    delegation_id,
++                ),
++            )
+             recovered += 1
+     return recovered
+ 
+ 
+ def restore_undelivered_completions(target_queue) -> int:
+-    """Enqueue durable pending completions as fresh turns after process start.
+-    Restored events are stamped ``restored=True`` in memory only: they came from a PREVIOUS
+-    process, so drains without an ownership filter must leave them for a consumer that can
+-    prove ownership. Rows older than ``_MAX_COMPLETION_REPLAY_AGE_S`` are terminally dropped
+-    instead of replaying a turn nobody is waiting on.
+-
+-    Every restored event is stamped ``restored=True`` (in-memory only — the stamp is added after the durable
+-    payload is deserialized and is never persisted). Restored events originate from a *previous* process, so
+-    no consumer in THIS process implicitly owns them: drain paths that run without an ownership filter (the
+-    legacy single-session behavior) must leave them queued for a consumer that can positively prove
+-    ownership, otherwise a brand-new session adopts a dead session's delegation results seconds after boot
+-    (#64484).
+-    """
++    """Replay legacy events unchanged; revalidate immutable guarded snapshots."""
+     recover_abandoned_delegations()
+     now = time.time()
+     with _DB_LOCK, _transaction() as conn:
+@@ -326,14 +498,28 @@ def restore_undelivered_completions(target_queue) -> int:
+                FROM async_delegations
+                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
+                ORDER BY completed_at, delegation_id""").fetchall()
+-        return _replay_pending(conn, rows, target_queue, now)
++        restored, guarded = _replay_pending(conn, rows, target_queue, now)
++    # Never acquire the external authority lock beneath the native DB lock.
++    return restored + _replay_guarded(guarded, target_queue)
++
++
++def _offer(target_queue, evt, delegation_id: str) -> None:
++    if isinstance(evt, dict):
++        evt["restored"] = True
++    target_queue.put(evt)
++    with _orphan_lock:
++        _offered.add((hermes_home_key(get_hermes_home()), delegation_id))
+ 
+ 
+-def _replay_pending(conn, rows, target_queue, now: float) -> int:
++def _replay_pending(conn, rows, target_queue, now: float):
+     """Put each pending ``(delegation_id, event_json, completed_at, dispatched_at)`` row on ``target_queue``
+     stamped ``restored``, or terminally drop it past ``_MAX_COMPLETION_REPLAY_AGE_S``. Records the offer so
+-    the orphan sweep skips the row until the copy is handed back (``return_completion_offer``)."""
+-    home, restored = hermes_home_key(get_hermes_home()), 0
++    the orphan sweep skips the row until the copy is handed back (``return_completion_offer``).
++
++    DC-03: events carrying a host completion fence are NOT offered here; they are returned as
++    ``guarded`` for revalidation by ``_replay_guarded`` after the caller leaves the DB lock.
++    Returns ``(restored, guarded)``."""
++    restored, guarded = 0, []
+     for delegation_id, payload, completed_at, dispatched_at in rows:
+         age_basis = completed_at or dispatched_at
+         if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+@@ -346,12 +532,49 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
+                            delegation_id, (now - age_basis) / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
+             continue
+         evt = json.loads(payload)
+-        if isinstance(evt, dict):
+-            evt["restored"] = True
+-        target_queue.put(evt)
+-        with _orphan_lock:
+-            _offered.add((home, delegation_id))
++        if isinstance(evt, dict) and "completion_fence" in evt and not _is_native_notice_event(evt, delegation_id):
++            guarded.append((delegation_id, evt, payload))
++            continue
++        _offer(target_queue, evt, delegation_id)
+         restored += 1
++    return restored, guarded
++
++
++def _replay_guarded(guarded, target_queue) -> int:
++    """DC-03: revalidate fenced pending completions under the host authority lock, then the DB lock."""
++    restored = 0
++    for delegation_id, evt, payload in guarded:
++        provider = _completion_guard_for()
++        if provider is None:
++            continue
++        try:
++            with _completion_guard_context(provider):
++                verdict = _guard_validate(provider, evt["completion_fence"], delegation_id)
++                if verdict is None:
++                    continue
++                with _DB_LOCK, _transaction() as conn:
++                    if not conn.in_transaction:
++                        conn.execute("BEGIN IMMEDIATE")
++                    row = conn.execute(
++                        "SELECT delivery_state, event_json, task_json FROM async_delegations WHERE delegation_id=?",
++                        (delegation_id,),
++                    ).fetchone()
++                    if row is None or row[0] != "pending" or row[1] != payload:
++                        continue
++                    present, stored = _stored_completion_fence(row[2])
++                    if not present or stored != evt["completion_fence"]:
++                        verdict = False
++                    if verdict is False:
++                        conn.execute(
++                            """UPDATE async_delegations SET delivery_state='dropped', delivery_claim=NULL,
++                            delivery_claimed_at=NULL, updated_at=? WHERE delegation_id=? AND delivery_state='pending'""",
++                            (time.time(), delegation_id),
++                        )
++                        continue
++                    _offer(target_queue, evt, delegation_id)
++                    restored += 1
++        except Exception:
++            logger.warning("Async completion replay guard unavailable for %s", delegation_id, exc_info=True)
+     return restored
+ 
+ 
+@@ -397,7 +620,8 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) ->
+                                delegation_id, _MAX_DELIVERY_ATTEMPTS)
+                 continue
+             orphans.append((delegation_id, payload, completed_at, dispatched_at))
+-        return _replay_pending(conn, orphans, target_queue, now)
++        restored, guarded = _replay_pending(conn, orphans, target_queue, now)
++    return restored + _replay_guarded(guarded, target_queue)
+ 
+ 
+ def maybe_sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> int:
+@@ -431,20 +655,193 @@ def mark_completion_delivered(delegation_id: str) -> bool:
+            WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
+ 
+ 
+-def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+-    """Claim one pending completion across competing consumers/processes."""
+-    now = time.time()
++_MISSING_COMPLETION_FENCE = object()
++
++
++def _native_notice_marker(marker, delegation_id):
++    return (
++        isinstance(marker, dict)
++        and set(marker) == {"native_terminal_notice", "delegation_id"}
++        and type(marker.get("native_terminal_notice")) is int
++        and marker["native_terminal_notice"] == 1
++        and marker.get("delegation_id") == delegation_id
++    )
++
++
++def _native_notice_fields():
++    return {
++        "type",
++        "delegation_id",
++        "session_key",
++        "origin_ui_session_id",
++        "origin_session_id",
++        "parent_session_id",
++        "goal",
++        "goals",
++        "context",
++        "toolsets",
++        "role",
++        "model",
++        "is_batch",
++        "status",
++        "dispatched_at",
++        "completed_at",
++    } | set(_ROUTING_KEYS)
++
++
++def _native_notice_error(status):
++    return f"Guarded delegation ended with native status {status}; no worker output was delivered. Inspect its durable result for details."
++
++
++def _as_native_notice(event):
++    notice = {k: v for k, v in event.items() if k in _native_notice_fields()}
++    notice.update(
++        summary=None,
++        error=_native_notice_error(event["status"]),
++        completion_fence={
++            "native_terminal_notice": 1,
++            "delegation_id": event["delegation_id"],
++        },
++    )
++    if event.get("is_batch"):
++        notice["results"] = []
++    return notice
++
++
++def _is_native_notice_event(event, delegation_id):
++    return (
++        isinstance(event, dict)
++        and event.get("delegation_id") == delegation_id
++        and _native_notice_marker(event.get("completion_fence"), delegation_id)
++        and event.get("status") in {"error", "stalled", "unknown"}
++        and event.get("summary") is None
++        and event.get("results", []) == []
++        and event.get("error") == _native_notice_error(event["status"])
++        and set(event)
++        <= _native_notice_fields()
++        | {"completion_fence", "summary", "error", "results", "restored"}
++    )
++
++
++def _stored_completion_fence(task_json: Any):
++    try:
++        task = json.loads(task_json or "{}")
++    except (TypeError, ValueError):
++        return False, None
++    if not isinstance(task, dict) or "completion_fence" not in task:
++        return False, None
++    return True, task.get("completion_fence")
++
++
++def _claim_marked_completion(
++    delegation_id: str,
++    claim_id: str,
++    marker: Any,
++    *,
++    row_exists: bool,
++    stored_present: bool,
++    stored_marker: Any,
++) -> bool:
++    notice = _native_notice_marker(marker, delegation_id)
++    provider = None if notice else _completion_guard_for()
++    if provider is None and not notice:
++        logger.warning(
++            "Async completion %s is guarded but no completion fence provider is registered",
++            delegation_id,
++        )
++        return False
++    if row_exists and (not stored_present or stored_marker != marker):
++        return False
++    with _completion_guard_context(provider):
++        if not notice and _guard_validate(provider, marker, delegation_id) is not True:
++            return False
++        now = time.time()
++        with _DB_LOCK, _transaction() as conn:
++            if not conn.in_transaction:
++                conn.execute("BEGIN IMMEDIATE")
++            row = conn.execute(
++                "SELECT delivery_state, task_json, event_json FROM async_delegations WHERE delegation_id=?",
++                (delegation_id,),
++            ).fetchone()
++            if row is None:
++                return False
++            present, current_marker = _stored_completion_fence(row[1])
++            if not present or current_marker != marker:
++                return False
++            if notice:
++                try:
++                    if not _is_native_notice_event(
++                        json.loads(row[2] or "null"), delegation_id
++                    ):
++                        return False
++                except (TypeError, ValueError):
++                    return False
++            cur = conn.execute(
++                """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
++                   delivery_attempts=delivery_attempts+1, updated_at=?
++                   WHERE delegation_id=? AND delivery_state='pending'
++                     AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
++                (claim_id, now, now, delegation_id, now - 300),
++            )
++            return cur.rowcount == 1
++
++
++def claim_completion_delivery(
++    delegation_id: str,
++    claim_id: str,
++    *,
++    completion_fence: Any = _MISSING_COMPLETION_FENCE,
++) -> bool:
++    """Claim without weakening legacy absence or guarded missing-row semantics."""
+     with _DB_LOCK, _transaction() as conn:
+         row = conn.execute(
+-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
+-        if row is None:
+-            return True  # legacy event created before durable dispatch
+-        cur = conn.execute("""UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
+-                      delivery_attempts=delivery_attempts+1, updated_at=?
+-               WHERE delegation_id=? AND delivery_state='pending'
+-                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+-            (claim_id, now, now, delegation_id, now - _CLAIM_LEASE_S))
+-        return cur.rowcount == 1
++            "SELECT delivery_state, task_json FROM async_delegations WHERE delegation_id=?",
++            (delegation_id,),
++        ).fetchone()
++    present, stored = (
++        _stored_completion_fence(row[1]) if row is not None else (False, None)
++    )
++    marked = completion_fence is not _MISSING_COMPLETION_FENCE
++    if not marked:
++        if present:
++            return False
++        now = time.time()
++        with _DB_LOCK, _transaction() as conn:
++            if not conn.in_transaction:
++                conn.execute("BEGIN IMMEDIATE")
++            current = conn.execute(
++                "SELECT delivery_state, task_json FROM async_delegations WHERE delegation_id=?",
++                (delegation_id,),
++            ).fetchone()
++            if current is None:
++                return True
++            if _stored_completion_fence(current[1])[0]:
++                return False
++            cur = conn.execute(
++                """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
++                delivery_attempts=delivery_attempts+1, updated_at=? WHERE delegation_id=? AND delivery_state='pending'
++                AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
++                (claim_id, now, now, delegation_id, now - _CLAIM_LEASE_S),
++            )
++            return cur.rowcount == 1
++    if row is None:
++        return False
++    try:
++        return _claim_marked_completion(
++            delegation_id,
++            claim_id,
++            completion_fence,
++            row_exists=True,
++            stored_present=present,
++            stored_marker=stored,
++        )
++    except Exception:
++        logger.warning(
++            "Async completion claim guard unavailable for %s",
++            delegation_id,
++            exc_info=True,
++        )
++        return False
+ 
+ 
+ def is_interim_delegation_event(evt: Dict[str, Any]) -> bool:
+@@ -462,7 +859,14 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
+     if not delegation_id:
+         return ""
+     claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
+-    return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
++    kwargs = {}
++    if "completion_fence" in evt:
++        kwargs["completion_fence"] = evt["completion_fence"]
++    return (
++        claim_id
++        if claim_completion_delivery(delegation_id, claim_id, **kwargs)
++        else None
++    )
+ 
+ 
+ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+@@ -755,11 +1159,23 @@ def _dispatch_admitted(
+         "_context": contextvars.copy_context(),
+         # Stale-monitor bookkeeping (see _stale_monitor_loop).
+         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
++    guard = _completion_guard_var.get()
+     with _records_lock:
+         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
+         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
+             return {"status": "rejected", "error": capacity_error}
++        previous_record = _records.get(delegation_id)
+         _records[delegation_id] = record
++        if guard is not None:
++            record["_completion_guard"] = guard
++            try:
++                record["_completion_fence"] = _guard_stamp(guard, record)
++            except Exception:
++                if previous_record is None:
++                    _records.pop(delegation_id, None)
++                else:
++                    _records[delegation_id] = previous_record
++                raise
+         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
+     _persist_dispatch(record)
+     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
+@@ -795,7 +1211,7 @@ def _dispatch_admitted(
+         retirement.release()
+         with _records_lock:
+             _records.pop(delegation_id, None)
+-        with _DB_LOCK, _transaction() as conn:
++        with _completion_guard_context(guard), _DB_LOCK, _transaction() as conn:
+             conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+         return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
+     if progress_fn is not None:
+@@ -928,17 +1344,76 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
+         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
+         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
+         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
+-        **{k: result[k] for k in _STALL_META_KEYS if k in result}}
+-    try:
+-        _persist_completion(evt, result)
+-    except Exception as exc:  # noqa: BLE001 — a lost durable row is recoverable; a lost result + leaked slot is not
+-        logger.error(f"Async delegation{label} %s: durable completion write failed; delivering in-memory "
+-                     "only (a restart may report this unit as unknown): %s", record.get("delegation_id"), exc)
++        **{k: result[k] for k in _STALL_META_KEYS if k in result},
++        **(
++            {"completion_fence": record.get("_completion_fence")}
++            if "_completion_fence" in record
++            else {}
++        ),
++    }
++    if "completion_fence" not in evt:
++        try:
++            _persist_completion(evt, result)
++        except Exception as exc:  # noqa: BLE001 — a lost durable row is recoverable; a lost result + leaked slot is not
++            logger.error(
++                f"Async delegation{label} %s: durable completion write failed; delivering in-memory "
++                "only (a restart may report this unit as unknown): %s",
++                record.get("delegation_id"),
++                exc,
++            )
++        try:
++            process_registry.completion_queue.put(evt)
++        except Exception as exc:  # pragma: no cover
++            logger.error(
++                f"Async delegation{label} %s: failed to enqueue completion event; result lost: %s",
++                record.get("delegation_id"),
++                exc,
++            )
++        return
++    if status in {"error", "stalled", "unknown"}:
++        notice = _as_native_notice(evt)
++        if _persist_completion(notice, result):
++            try:
++                process_registry.completion_queue.put(notice)
++            except Exception:
++                logger.warning(
++                    "Native terminal notice retained for replay", exc_info=True
++                )
++        return
++    guard = _completion_guard_for(record)
+     try:
+-        process_registry.completion_queue.put(evt)
+-    except Exception as exc:  # pragma: no cover
+-        logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
+-                     "result lost: %s", record.get("delegation_id"), exc)
++        with _completion_guard_context(guard):
++            verdict = None
++            if guard is not None:
++                prepared = _guard_prepare(
++                    guard, evt["completion_fence"], record["delegation_id"]
++                )
++                if prepared is None or _native_notice_marker(
++                    prepared, record["delegation_id"]
++                ):
++                    verdict = False
++                else:
++                    evt["completion_fence"] = prepared
++                    verdict = _guard_validate(guard, prepared, record["delegation_id"])
++            admitted = _persist_completion(
++                evt, result, delivery_state="dropped" if verdict is False else "pending"
++            )
++            if verdict is True and admitted:
++                process_registry.completion_queue.put(evt)
++    except Exception:
++        try:
++            _persist_completion(evt, result)
++        except Exception:
++            logger.error(
++                "Unable to persist guarded completion %s",
++                record.get("delegation_id"),
++                exc_info=True,
++            )
++        logger.warning(
++            "Async completion guard unavailable for %s",
++            record.get("delegation_id"),
++            exc_info=True,
++        )
+ 
+ 
+ def push_task_failure_notice(delegation_id: str, entry: Dict[str, Any], *, n_tasks: int) -> None:
+@@ -1189,7 +1664,9 @@ def interrupt_for_session(
+ 
+ def _reset_for_tests() -> None:
+     """Test-only: clear all state and tear down the executor + monitor."""
+-    global _executor, _executor_max_workers, _monitor_thread
++    global _executor, _executor_max_workers, _monitor_thread, _completion_guard_default
++    with _completion_guard_lock:
++        _completion_guard_default = None
+     with _executor_lock:
+         if _executor is not None:
+             _executor.shutdown(wait=False)

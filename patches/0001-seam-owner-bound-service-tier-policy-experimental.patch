@@ -1,0 +1,391 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tobific <tobific@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH 1/8] seam: owner-bound service-tier policy (experimental)
+
+Adds agent/service_tier_policy.py and a PluginContext mixin
+(register_service_tier_policy). A profile-selected plugin callback decides
+"normal" or "priority" per request; the decision is bound to the request
+owner (gateway turn, delegation child, cron job, background review) and is
+re-evaluated when the route changes. fast_mode, turn_api_call,
+background_review and delegate_tool consult it. The orchestrator's
+native_worker/tier_authority use capture_request_owner and _Decision.
+
+Experimental, built against Hermes 8a3ede1b.
+---
+ agent/background_review.py         |   3 +
+ agent/fast_mode.py                 |   7 +-
+ agent/service_tier_policy.py       | 225 +++++++++++++++++++++++++++++
+ agent/turn_api_call.py             |   3 +
+ hermes_cli/plugins.py              |   8 +-
+ hermes_cli/plugins_service_tier.py |  22 +++
+ tools/delegate_tool.py             |   2 +
+ 7 files changed, 268 insertions(+), 2 deletions(-)
+ create mode 100644 agent/service_tier_policy.py
+ create mode 100644 hermes_cli/plugins_service_tier.py
+
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 3b741ca882..383db6697f 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -979,6 +979,9 @@ def build_cache_parity_fork(
+     if not _routed and write_origin == "background_review":
+         _warn_ignored_reasoning_effort(agent, task_cfg)
+     review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations, task_cfg))
++    from agent.service_tier_policy import capture_request_owner
++
++    capture_request_owner(review_agent, kind="auxiliary", identity=write_origin)
+     review_agent._memory_write_origin = review_agent._memory_write_context = write_origin
+     # Fork-turn log tag: the fork shares the parent's session_id (and model on the
+     # same-model path), so its turn-start/turn-exit log lines are otherwise
+diff --git a/agent/fast_mode.py b/agent/fast_mode.py
+index 04a0498802..3d6ac7db03 100644
+--- a/agent/fast_mode.py
++++ b/agent/fast_mode.py
+@@ -24,6 +24,9 @@ _FAST_LIMIT_HEADERS = ("anthropic-fast-input-tokens-limit", "anthropic-fast-outp
+ 
+ def begin_turn(agent: Any, conversation_history: Any) -> None:
+     """Open (or refuse) the fast window at a user-turn boundary."""
++    from agent.service_tier_policy import begin_turn as begin_policy_turn
++
++    begin_policy_turn(agent)
+     mode = getattr(agent, "service_tier", None)
+     agent._fast_until = 0.0
+     if mode not in BOUNDED_MODES:
+@@ -43,6 +46,8 @@ def begin_turn(agent: Any, conversation_history: Any) -> None:
+ def effective_request_overrides(agent: Any) -> dict[str, Any]:
+     """``agent.request_overrides`` plus the fast override while the window is open, minus
+     ``speed`` for a model this session learned has no fast capacity."""
++    from agent.service_tier_policy import apply_tier
++
+     overrides = dict(getattr(agent, "request_overrides", None) or {})
+     if getattr(agent, "service_tier", None) in BOUNDED_MODES and time.monotonic() < getattr(agent, "_fast_until", 0.0):
+         from hermes_cli.models import resolve_fast_mode_overrides
+@@ -54,7 +59,7 @@ def effective_request_overrides(agent: Any) -> dict[str, Any]:
+         )
+     if "speed" in overrides and getattr(agent, "model", None) in (getattr(agent, "_fast_mode_unavailable_models", None) or ()):
+         overrides.pop("speed", None)
+-    return overrides
++    return apply_tier(agent, overrides)
+ 
+ 
+ def fast_mode_unprovisioned(api_error: Any, api_kwargs: Any) -> bool:
+diff --git a/agent/service_tier_policy.py b/agent/service_tier_policy.py
+new file mode 100644
+index 0000000000..3e3c4519a1
+--- /dev/null
++++ b/agent/service_tier_policy.py
+@@ -0,0 +1,225 @@
++"""Opt-in tier consumption, independent of captured provider/model routing."""
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass
++from pathlib import Path
++from threading import Event
++
++
++class ServiceTierPolicyError(RuntimeError):
++    """A required consumption policy is unavailable; execution must stop."""
++
++
++@dataclass(frozen=True)
++class RequestOrigin:
++    profile_home: Path
++    kind: str = ""
++    message: str = ""
++    identity: str = ""
++    job_name: str = ""
++
++
++@dataclass(frozen=True)
++class ServiceTierRequest:
++    origin: RequestOrigin
++    platform: str
++    session_id: str
++    provider: str
++    model: str
++    api_mode: str
++    base_url: str
++
++
++@dataclass(frozen=True)
++class _OriginBinding:
++    origin: RequestOrigin
++    guard: object
++    revoked: Event
++
++    def check(self):
++        try:
++            if self.revoked.is_set():
++                raise ValueError("Expired scope")
++            if self.guard is not None:
++                self.guard()
++        except Exception:
++            raise ServiceTierPolicyError(
++                "Service-tier consumer ownership expired"
++            ) from None
++
++
++_ORIGIN = ContextVar("service_tier_origin", default=None)
++
++
++@contextmanager
++def request_origin_scope(*, kind, message="", identity="", job_name="", guard=None):
++    from hermes_constants import get_hermes_home
++
++    origin = RequestOrigin(get_hermes_home(), kind, message, identity, job_name)
++    binding = _OriginBinding(origin, guard, Event())
++    token = _ORIGIN.set(binding)
++    try:
++        yield origin
++    finally:
++        binding.revoked.set()
++        _ORIGIN.reset(token)
++
++
++def capture_request_owner(agent, *, kind, identity="", job_name=""):
++    """Queued agents own their consumer/profile, not an inherited foreground exemption."""
++    from hermes_constants import get_hermes_home
++
++    agent._service_tier_owner = RequestOrigin(
++        get_hermes_home(), kind, "", identity, job_name
++    )
++
++
++def _selected_policy(home):
++    from utils import fast_safe_load
++    from hermes_cli.plugins import get_plugin_manager
++
++    try:
++        path = home / "config.yaml"
++        try:
++            with path.open(encoding="utf-8") as stream:
++                config = fast_safe_load(stream)
++        except FileNotFoundError:
++            config = {}
++        if config is None:
++            config = {}
++        if not isinstance(config, dict):
++            raise ValueError("Invalid profile config")
++        key = config.get("service_tier_policy")
++        if key is None:
++            return None
++        if not isinstance(key, str) or not key.strip():
++            raise ValueError("Invalid policy selection")
++        manager = get_plugin_manager()
++        manager.discover_and_load()
++        callback = getattr(manager, "_service_tier_policies", {}).get(key)
++        if not callable(callback):
++            raise ValueError("Missing selected policy")
++        return key, callback, manager
++    except Exception:
++        raise ServiceTierPolicyError(
++            "Required service-tier policy is unavailable"
++        ) from None
++
++
++@dataclass(frozen=True)
++class _Decision:
++    request: ServiceTierRequest
++    key: str
++    callback: object
++    manager: object
++    tier: str | None
++    owner: _OriginBinding | None
++
++    def check(self):
++        if self.owner is not None:
++            self.owner.check()
++        from hermes_constants import get_hermes_home
++
++        if (
++            get_hermes_home() != self.request.origin.profile_home
++            or getattr(self.manager, "_service_tier_policies", {}).get(self.key)
++            is not self.callback
++        ):
++            raise ServiceTierPolicyError("Service-tier policy ownership expired")
++
++
++def begin_turn(agent):
++    from hermes_constants import get_hermes_home
++
++    home = get_hermes_home()
++    agent._service_tier_decision = None
++    captured = getattr(agent, "_service_tier_owner", None)
++    owner = None if captured is not None else _ORIGIN.get()
++    origin = captured or (owner.origin if owner is not None else RequestOrigin(home))
++    selected = _selected_policy(home)
++    if selected is None:
++        if (
++            type(origin) is RequestOrigin
++            and origin.profile_home != home
++            and _selected_policy(origin.profile_home) is not None
++        ):
++            raise ServiceTierPolicyError("Service-tier policy profile mismatch")
++        return
++    if type(origin) is not RequestOrigin or origin.profile_home != home:
++        raise ServiceTierPolicyError("Service-tier policy profile mismatch")
++    if owner is not None:
++        owner.check()
++    request = ServiceTierRequest(
++        origin,
++        str(getattr(agent, "platform", "") or ""),
++        str(getattr(agent, "session_id", "") or ""),
++        str(agent.provider or ""),
++        str(agent.model or ""),
++        str(agent.api_mode or ""),
++        str(agent.base_url or ""),
++    )
++    key, callback, manager = selected
++    try:
++        result = callback(request)
++    except Exception:
++        raise ServiceTierPolicyError("Required service-tier policy failed") from None
++    if result is not None and (
++        type(result) is not str or result not in ("normal", "priority")
++    ):
++        raise ServiceTierPolicyError("Invalid service-tier policy result")
++    decision = _Decision(request, key, callback, manager, result, owner)
++    decision.check()
++    agent._service_tier_decision = decision
++
++
++def apply_tier(agent, overrides):
++    decision = getattr(agent, "_service_tier_decision", None)
++    if not isinstance(decision, _Decision):
++        return overrides
++    decision.check()
++    request = decision.request
++    if (
++        agent.provider, agent.model, agent.api_mode, agent.base_url,
++    ) != (request.provider, request.model, request.api_mode, request.base_url):
++        # A fallback is a new route, not permission to reuse stale tier kwargs.
++        # Preserve this agent's original request owner across nested contexts.
++        token = _ORIGIN.set(decision.owner)
++        try:
++            begin_turn(agent)
++        finally:
++            _ORIGIN.reset(token)
++        decision = getattr(agent, "_service_tier_decision", None)
++        if not isinstance(decision, _Decision):
++            return overrides
++        decision.check()
++        request = decision.request
++        if (agent.provider, agent.model, agent.api_mode, agent.base_url) != (
++            request.provider, request.model, request.api_mode, request.base_url
++        ):
++            raise ServiceTierPolicyError("Route changed during tier policy evaluation")
++    if decision.tier is None:
++        return overrides
++    if "model" in overrides and overrides["model"] != request.model:
++        raise ServiceTierPolicyError("Wire model changed after the tier decision")
++    body = overrides.get("extra_body")
++    if isinstance(body, dict) and "model" in body and body["model"] != request.model:
++        raise ServiceTierPolicyError("Wire model changed after the tier decision")
++    from hermes_cli.models import resolve_fast_mode_overrides
++
++    fast = resolve_fast_mode_overrides(
++        agent.model, provider=agent.provider, base_url=agent.base_url
++    )
++    if not fast:
++        raise ServiceTierPolicyError("Selected route does not support a tier policy")
++    result = dict(overrides)
++    for key in ("service_tier", "speed"):
++        result.pop(key, None)
++    if isinstance(result.get("extra_body"), dict):
++        body = dict(result["extra_body"])
++        for key in ("service_tier", "speed"):
++            body.pop(key, None)
++        result["extra_body"] = body
++    if decision.tier == "priority":
++        result.update(fast)
++    return result
+diff --git a/agent/turn_api_call.py b/agent/turn_api_call.py
+index 36d8c977ab..2f6e9ea375 100644
+--- a/agent/turn_api_call.py
++++ b/agent/turn_api_call.py
+@@ -87,6 +87,9 @@ def perform_api_call(
+     _use_streaming = _should_stream(agent)
+ 
+     def _perform_api_call(next_api_kwargs):
++        from agent.service_tier_policy import apply_tier
++
++        next_api_kwargs = apply_tier(agent, next_api_kwargs)
+         if agent.api_mode == "codex_responses":
+             next_api_kwargs = agent._get_transport().preflight_kwargs(
+                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index bba82a3b4b..8805d2974b 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -58,6 +58,7 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
+     RenderedPluginSystemPromptSection, _EventSubscription, format_system_prompt_sections,
+     is_valid_system_prompt_section_id,
+ )
++from hermes_cli.plugins_service_tier import ServiceTierPluginContextMixin
+ from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
+ from hermes_cli.plugins_state import (
+     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
+@@ -227,7 +228,7 @@ class LoadedPlugin:
+     deferred: bool = False
+ 
+ 
+-class PluginContext:
++class PluginContext(ServiceTierPluginContextMixin):
+     """Facade given to plugins so they can register tools and hooks."""
+ 
+     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+@@ -1148,6 +1149,11 @@ for _name, _method in list(vars(PluginContext).items()):
+     if callable(_method) and (_name.startswith("register_") or _name in {"subscribe", "on_unload"}):
+         setattr(PluginContext, _name, _ignore_after_abandoned_load(_method))
+ del _name, _method
++# The GW-03 registrar lives on a mixin, so vars(PluginContext) above does not see it; guard it too
++# (mixin registrars need the same guard).
++for _name in ("register_service_tier_policy",):
++    setattr(PluginContext, _name, _ignore_after_abandoned_load(getattr(PluginContext, _name)))
++del _name
+ 
+ 
+ def _resolve_hook_callback_timeout() -> float:
+diff --git a/hermes_cli/plugins_service_tier.py b/hermes_cli/plugins_service_tier.py
+new file mode 100644
+index 0000000000..2749695952
+--- /dev/null
++++ b/hermes_cli/plugins_service_tier.py
+@@ -0,0 +1,22 @@
++"""Registration for required, profile-selected service-tier consumption policy."""
++
++from hermes_cli.plugins_loader import _serialized_replacement
++
++
++class ServiceTierPluginContextMixin:
++    @_serialized_replacement
++    def register_service_tier_policy(self, name, callback):
++        """Receive an immutable ServiceTierRequest; return None, normal or priority."""
++        if not isinstance(name, str) or not name.strip() or not callable(callback):
++            raise ValueError("A service-tier policy requires a name and callback")
++        if not hasattr(self._manager, "_service_tier_policies"):
++            self._manager._service_tier_policies = {}
++        key = self.plugin_id + ":" + name
++        return self._register_entry(
++            "service_tier_policy",
++            key,
++            self._manager._service_tier_policies,
++            callback,
++            "Plugin %s registered service-tier policy: %s",
++            key,
++        )
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 9e2379f103..86fcaecf6f 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -254,6 +254,8 @@ def _build_child_agent(
+                     from hermes_state_registry import release_or_close
+                     release_or_close(child_session_db)
+             raise
++    from agent.service_tier_policy import capture_request_owner
++    capture_request_owner(child, kind="delegation", identity=subagent_id)
+     child._print_fn = getattr(parent_agent, "_print_fn", None)
+     _apply_child_cache_ttl(child)
+     if child_session_db is not None:

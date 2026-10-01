@@ -1,0 +1,356 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tobific <tobific@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH 4/8] seam: opt-in request observation for Codex streams
+ (experimental)
+
+agent/codex_runtime.py: when a host observer is attached, per-call HTTPX
+hooks record the actual provider request/response route so a worker's
+result can be bound to the exact model that served it. Without an observer
+the native path is unchanged.
+
+Experimental, built against Hermes 8a3ede1b.
+---
+ agent/codex_runtime.py | 322 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 321 insertions(+), 1 deletion(-)
+
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index b20faa31d4..134fd49420 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -1034,6 +1034,324 @@ def _sanitize_consumer_codex_request(agent: Any, request: dict[str, Any]) -> dic
+     return sanitized
+ 
+ 
++# ---- BEGIN OPT-IN REQUEST OBSERVATION ---------------------------------------
++# This block is intentionally adjacent to the native entry point.  It only
++# installs per-call HTTPX hooks when the host supplies an observer; the native
++# no-observer path below remains a direct call with no client mutation.
++import functools as _observation_functools
++import threading as _observation_threading
++
++_codex_request_observation_var: contextvars.ContextVar[Any | None] = (
++    contextvars.ContextVar("codex_request_observation", default=None)
++)
++_codex_observation_hooks_lock = _observation_threading.RLock()
++_OBSERVATION_MISSING = object()
++
++
++class _CodexRequestObservationState:
++    """Safe per-native-call state; pending HTTPX requests are cleared at call end."""
++
++    def __init__(self, agent: Any, observer: Any):
++        self.agent = agent
++        self.observer = observer
++        self.owner_token = object()
++        self.native_completed = False
++        self.native_failed = False
++        self.callback_failed = False
++        self.missing_callbacks = 0
++        self.sdk_invocations = 0
++        self.http_exchanges = 0
++        self.response_events = 0
++        self.failed_exchanges = 0
++        self.current_sdk_invocation: int | None = None
++        self.pending: list[tuple[int, int, Any]] = []
++        self.bindings: list[tuple[Any, str, Any]] = []
++
++
++def _observation_next_invocation(agent: Any) -> int:
++    with _codex_observation_hooks_lock:
++        value = int(getattr(agent, "_codex_observation_invocation_counter", 0) or 0) + 1
++        agent._codex_observation_invocation_counter = value
++        return value
++
++
++def _observation_lifecycle(
++    observer: Any, name: str, state: _CodexRequestObservationState
++) -> None:
++    try:
++        callback = getattr(observer, name, None)
++    except BaseException:
++        state.callback_failed = True
++        return
++    if not callable(callback):
++        return
++    try:
++        callback(state)
++    except BaseException:
++        # Observer/lifecycle failures are deliberately never logged: the
++        # observer may receive sensitive context through its own implementation.
++        state.callback_failed = True
++
++
++def _observation_deliver(
++    state: _CodexRequestObservationState, event: dict[str, Any]
++) -> None:
++    try:
++        event["owner_token"] = state.owner_token
++        state.observer(event)
++    except BaseException:
++        # The callback boundary is best effort and must not alter provider
++        # result, retry, cancellation, or exception semantics.
++        state.callback_failed = True
++
++
++def _observation_hooks(http_client: Any) -> Any | None:
++    for name in ("event_hooks", "_event_hooks"):
++        try:
++            hooks = getattr(http_client, name)
++        except BaseException:
++            continue
++        if isinstance(hooks, dict) and "request" in hooks and "response" in hooks:
++            return hooks
++    return None
++
++
++def _observation_remove_hooks(state: _CodexRequestObservationState) -> None:
++    with _codex_observation_hooks_lock:
++        for hooks, phase, hook in state.bindings:
++            try:
++                current = hooks.get(phase)
++                if isinstance(current, list):
++                    current[:] = [
++                        existing for existing in current if existing is not hook
++                    ]
++            except BaseException:
++                state.missing_callbacks += 1
++        state.bindings.clear()
++
++
++def _observation_take_pending(
++    state: _CodexRequestObservationState, request: Any = _OBSERVATION_MISSING
++) -> tuple[int, int, Any] | None:
++    if not state.pending:
++        return None
++    if request is not _OBSERVATION_MISSING:
++        for index, item in enumerate(state.pending):
++            if item[2] is request:
++                return state.pending.pop(index)
++        # A substituted response request cannot prove what was sent.
++        return None
++    return state.pending.pop(0)
++
++
++def _observation_request_hook(
++    state: _CodexRequestObservationState, request: Any
++) -> None:
++    try:
++        if _codex_request_observation_var.get() is not state:
++            return
++        sdk_invocation = state.current_sdk_invocation
++        if sdk_invocation is None:
++            state.missing_callbacks += 1
++            return
++        state.http_exchanges += 1
++        state.pending.append((sdk_invocation, state.http_exchanges, request))
++        _observation_deliver(
++            state,
++            {
++                "phase": "request",
++                "sdk_invocation": sdk_invocation,
++                "http_exchange": state.http_exchanges,
++                "attempt": state.http_exchanges,
++                "request": request,
++                "response": None,
++                "error": None,
++            },
++        )
++    except BaseException:
++        state.missing_callbacks += 1
++
++
++def _observation_response_hook(
++    state: _CodexRequestObservationState, response: Any
++) -> None:
++    try:
++        if _codex_request_observation_var.get() is not state:
++            return
++        request = getattr(response, "request", _OBSERVATION_MISSING)
++        pending = _observation_take_pending(state, request)
++        if request is _OBSERVATION_MISSING or request is None:
++            state.missing_callbacks += 1
++            return
++        if pending is None:
++            state.missing_callbacks += 1
++            return
++        sdk_invocation, exchange, _request_hook_request = pending
++        state.response_events += 1
++        _observation_deliver(
++            state,
++            {
++                "phase": "response",
++                "sdk_invocation": sdk_invocation,
++                "http_exchange": exchange,
++                "attempt": exchange,
++                # The response's request is authoritative after SDK transforms.
++                "request": request,
++                "response": response,
++                "error": None,
++            },
++        )
++    except BaseException:
++        # A malformed response or observer implementation can never become a
++        # provider-visible hook exception.
++        state.missing_callbacks += 1
++
++
++def _observation_install_hooks(
++    state: _CodexRequestObservationState, active_client: Any
++) -> None:
++    try:
++        http_client = getattr(active_client, "_client", None)
++    except BaseException:
++        state.missing_callbacks += 1
++        return
++    hooks = _observation_hooks(http_client)
++    if hooks is None:
++        state.missing_callbacks += 1
++        return
++
++    def request_hook(request: Any) -> None:
++        _observation_request_hook(state, request)
++
++    def response_hook(response: Any) -> None:
++        _observation_response_hook(state, response)
++
++    with _codex_observation_hooks_lock:
++        request_added = False
++        try:
++            # Append-only installation preserves every pre-existing hook and its
++            # order.  Removal below uses identity and touches no other hook.
++            hooks["request"].append(request_hook)
++            request_added = True
++            hooks["response"].append(response_hook)
++        except BaseException:
++            if request_added:
++                try:
++                    hooks["request"][:] = [
++                        existing
++                        for existing in hooks["request"]
++                        if existing is not request_hook
++                    ]
++                except BaseException:
++                    pass
++            state.missing_callbacks += 1
++            return
++    state.bindings.extend((
++        (hooks, "request", request_hook),
++        (hooks, "response", response_hook),
++    ))
++
++
++def _observation_emit_errors(
++    state: _CodexRequestObservationState, error: BaseException
++) -> None:
++    """Emit one opaque error event per request attempt lacking a response."""
++    if _codex_request_observation_var.get() is not state:
++        return
++    pending = []
++    while state.pending:
++        item = _observation_take_pending(state)
++        if item is not None:
++            pending.append(item)
++    if not pending:
++        return
++    for sdk_invocation, exchange, request in pending:
++        state.failed_exchanges += 1
++        _observation_deliver(
++            state,
++            {
++                "phase": "error",
++                "sdk_invocation": sdk_invocation,
++                "http_exchange": exchange,
++                "attempt": exchange,
++                "request": request,
++                "response": None,
++                "error": error,
++            },
++        )
++
++
++def _codex_observed_responses_create(active_client: Any, stream_kwargs: dict[str, Any]):
++    """Call the real SDK unchanged while exposing transformed HTTPX events."""
++    state = _codex_request_observation_var.get()
++    if state is None:
++        return active_client.responses.create(**stream_kwargs)
++    state.sdk_invocations += 1
++    state.current_sdk_invocation = _observation_next_invocation(state.agent)
++    _observation_install_hooks(state, active_client)
++    try:
++        return active_client.responses.create(**stream_kwargs)
++    except BaseException as exc:
++        _observation_emit_errors(state, exc)
++        raise
++    finally:
++        _observation_remove_hooks(state)
++
++
++def _codex_request_observation(func: Callable) -> Callable:
++    """Opt-in wrapper; strict host adapters must validate the retained state."""
++
++    @_observation_functools.wraps(func)
++    def wrapped(agent: Any, *args: Any, **kwargs: Any):
++        observer = getattr(agent, "_codex_request_observer", None)
++        if observer is None:
++            if _codex_request_observation_var.get() is None:
++                return func(agent, *args, **kwargs)
++            token = _codex_request_observation_var.set(None)
++            try:
++                return func(agent, *args, **kwargs)
++            finally:
++                _codex_request_observation_var.reset(token)
++        state = _CodexRequestObservationState(agent, observer)
++        # This is the current logical call's ownership token.  It is replaced
++        # on every opted-in call so a later short-circuit cannot reuse proof.
++        with _codex_observation_hooks_lock:
++            active = getattr(agent, "_codex_observation_active", [])
++            if active:
++                state.callback_failed = True
++                for other in active:
++                    other.callback_failed = True
++            active.append(state)
++            agent._codex_observation_active = active
++            agent._codex_request_observation_state = state
++        context_token = _codex_request_observation_var.set(state)
++        _observation_lifecycle(observer, "_codex_observation_begin", state)
++        try:
++            try:
++                result = func(agent, *args, **kwargs)
++            except BaseException:
++                state.native_failed = True
++                raise
++            else:
++                state.native_completed = True
++                return result
++        finally:
++            if state.pending:
++                state.missing_callbacks += len(state.pending)
++                state.pending.clear()
++            _observation_lifecycle(observer, "_codex_observation_finish", state)
++            _observation_remove_hooks(state)
++            _codex_request_observation_var.reset(context_token)
++            with _codex_observation_hooks_lock:
++                agent._codex_observation_active.remove(state)
++
++    return wrapped
++
++
++# ---- END OPT-IN REQUEST OBSERVATION -----------------------------------------
++
++
++@_codex_request_observation
+ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+     """One streaming Responses API request over raw ``responses.create(stream=True)`` events."""
+     import httpx as _httpx
+@@ -1130,7 +1448,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+             )
+         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
+         stream_kwargs["stream"] = True
+-        return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
++        return _codex_observed_responses_create(
++            active_client, bypass_sdk_request_transform(stream_kwargs)
++        )
+ 
+     def _log_failure(exc: BaseException) -> None:
+         request_body_bytes, exception_chain = _codex_request_failure_details(exc)

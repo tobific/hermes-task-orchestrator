@@ -1,0 +1,389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tobific <tobific@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH 8/8] seam: cron per-job tier/no-fallback and memory isolation
+ (experimental)
+
+cron/scheduler_agent.py builds cron agents; jobs may carry service_tier
+(normal|priority) and allow_fallbacks=false; cron agents run with
+skip_memory=True and the memory toolset disabled. Optional for the
+orchestrator (used by its cron effort tool).
+
+Experimental, built against Hermes 8a3ede1b.
+---
+ cron/jobs.py            |  28 +++++++++++
+ cron/scheduler.py       |  56 +++++++---------------
+ cron/scheduler_agent.py | 104 ++++++++++++++++++++++++++++++++++++++++
+ tools/cronjob_tools.py  |  28 +++++++++--
+ 4 files changed, 174 insertions(+), 42 deletions(-)
+ create mode 100644 cron/scheduler_agent.py
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index ebc659733f..032d1fe224 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -1712,6 +1712,25 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
+ 
+ # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
+ # storing.
++def _normalize_job_service_tier(value: Any) -> Optional[str]:
++    if value is None:
++        return None
++    if not isinstance(value, str):
++        raise ValueError("service_tier must be normal or priority")
++    value = value.strip().lower()
++    if not value:
++        return None
++    if value not in {"normal", "priority"}:
++        raise ValueError("service_tier must be normal or priority")
++    return value
++
++
++def _normalize_job_allow_fallbacks(value: Any) -> Optional[bool]:
++    if value is not None and type(value) is not bool:
++        raise ValueError("allow_fallbacks must be a boolean")
++    return value
++
++
+ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
+     "model": _normalize_job_optional_text,
+     "provider": _normalize_job_optional_text,
+@@ -1725,6 +1744,8 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
+     "context_from": _normalize_context_from,
+     "failure_deliver": _normalize_failure_deliver,
+     "interpreter": _normalize_job_optional_text,
++    "service_tier": _normalize_job_service_tier,
++    "allow_fallbacks": _normalize_job_allow_fallbacks,
+ }
+ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
+     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
+@@ -1732,6 +1753,8 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
+     "monitor_url": _normalize_job_optional_text,
+     "interpreter": _normalize_job_optional_text,
+     "reasoning_effort": _normalize_reasoning_effort,
++    "service_tier": _normalize_job_service_tier,
++    "allow_fallbacks": _normalize_job_allow_fallbacks,
+ }
+ 
+ 
+@@ -1803,6 +1826,8 @@ def create_job(
+     paused_reason: Optional[str] = None,
+     pinned: bool = False,
+     interpreter: Optional[str] = None,
++    service_tier: Optional[str] = None,
++    allow_fallbacks: Optional[bool] = None,
+ ) -> Dict[str, Any]:
+     """Create a new cron job and return the stored record.
+ 
+@@ -1837,6 +1862,8 @@ def create_job(
+     normalized_skills = _normalize_skill_list(skill, skills)
+     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
++    normalized_service_tier = _normalize_job_service_tier(service_tier)
++    normalized_allow_fallbacks = _normalize_job_allow_fallbacks(allow_fallbacks)
+ 
+     _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
+     prompt_text = _coerce_job_text(prompt).strip()
+@@ -1899,6 +1926,7 @@ def create_job(
+     for key, value in (
+         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
+         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
++        ("service_tier", normalized_service_tier), ("allow_fallbacks", normalized_allow_fallbacks),
+     ):
+         if value is not None:
+             job[key] = value
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index a22815f389..d959075f8d 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -452,9 +452,9 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
+     """
+     cron_cfg = (cfg or {}).get("cron") or {}
+     if cron_cfg.get("allow_agent_scheduling"):
+-        disabled = ["messaging", "clarify"]
++        disabled = ["messaging", "clarify", "memory"]
+     else:
+-        disabled = ["cronjob", "messaging", "clarify"]
++        disabled = ["cronjob", "messaging", "clarify", "memory"]
+     agent_cfg = (cfg or {}).get("agent") or {}
+     from agent.skill_utils import parse_config_string_list
+ 
+@@ -1728,6 +1728,10 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
+         resolve_runtime_provider, format_runtime_provider_error)
+     from hermes_cli.auth import AuthError
+ 
++    from cron.jobs import _normalize_job_service_tier, _normalize_job_allow_fallbacks
++    _normalize_job_service_tier(job.get("service_tier"))
++    allow_fallbacks = _normalize_job_allow_fallbacks(job.get("allow_fallbacks"))
++
+     model = jc.model
+     requested = job.get("provider") or jc.cron_default_provider or None
+     try:
+@@ -1746,7 +1750,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
+         # OAuth refresh); anything else re-raises.
+         is_auth = isinstance(resolve_exc, AuthError)
+         is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
+-        if not (is_auth or is_transient_net):
++        if allow_fallbacks is False or not (is_auth or is_transient_net):
+             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
+ 
+         chain = _job_fallback_chain(job, jc.cfg) or []
+@@ -2392,7 +2396,10 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
+     )
+     # Mid-run provider ladder: same rule as resolution above, so a pinned job cannot be swapped
+     # onto the global chain by a 5xx/429 either.
+-    setup.fallback_model = _job_fallback_chain(job, _cfg)
++    from cron.jobs import _normalize_job_allow_fallbacks
++    # DC-08: an explicit allow_fallbacks=False disables every chain; otherwise native pin scoping.
++    setup.fallback_model = ([] if _normalize_job_allow_fallbacks(job.get("allow_fallbacks")) is False
++                            else _job_fallback_chain(job, _cfg))
+     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
+     # MCP servers must be registered before AIAgent is constructed.
+     _init_cron_mcp_tools(job_id)
+@@ -2406,39 +2413,9 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
+ 
+ 
+ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
+-    runtime = setup.runtime
+-    pr = _cfg.get("provider_routing") or {}
+-    return AIAgent(
+-        model=setup.model,
+-        api_key=runtime.get("api_key"),
+-        base_url=runtime.get("base_url"),
+-        provider=runtime.get("provider"),
+-        requested_provider=runtime.get("requested_provider"),
+-        api_mode=runtime.get("api_mode"),
+-        request_overrides=runtime.get("request_overrides"),
+-        acp_command=runtime.get("command"),
+-        acp_args=runtime.get("args"),
+-        max_iterations=setup.max_iterations,
+-        reasoning_config=setup.reasoning_config,
+-        prefill_messages=setup.prefill_messages,
+-        fallback_model=setup.fallback_model,
+-        credential_pool=setup.credential_pool,
+-        providers_allowed=pr.get("only"),
+-        providers_ignored=pr.get("ignore"),
+-        providers_order=pr.get("order"),
+-        provider_sort=pr.get("sort"),
+-        openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
+-        enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+-        disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+-        quiet_mode=True,
+-        # Project context files only with a configured workdir; SOUL.md always.
+-        skip_context_files=not bool(workdir),
+-        load_soul_identity=True,
+-        skip_memory=False,
+-        skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
+-        platform="cron",
+-        session_id=session_id,
+-        session_db=session_db,
++    from cron.scheduler_agent import construct_cron_agent
++    return construct_cron_agent(
++        AIAgent, job, _cfg, setup, workdir=workdir, session_id=session_id, session_db=session_db
+     )
+ 
+ 
+@@ -2519,9 +2496,10 @@ def run_job(
+ 
+         # Open state.db only after every early-return gate has passed.
+         _session_db = _open_cron_session_db(job)
+-        agent = _construct_cron_agent(
++        from cron.scheduler_agent import construct_cron_agent
++        agent = construct_cron_agent(
+             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
+-            session_db=_session_db)
++            session_db=_session_db, skip_background_review=True)
+         _audit = _FireAudit(job, job_id, model)
+ 
+         result = _run_agent_with_watchdog(
+diff --git a/cron/scheduler_agent.py b/cron/scheduler_agent.py
+new file mode 100644
+index 0000000000..eb195020b2
+--- /dev/null
++++ b/cron/scheduler_agent.py
+@@ -0,0 +1,104 @@
++"""Cron agent construction, separate from scheduling and delivery."""
++
++from __future__ import annotations
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from cron.scheduler import _CronAgentSetup
++
++
++def construct_cron_agent(
++    AIAgent,
++    job: dict,
++    _cfg: dict,
++    setup: _CronAgentSetup,
++    *,
++    workdir,
++    session_id,
++    session_db,
++    skip_background_review=True,
++):
++    from cron.scheduler import (
++        _resolve_cron_enabled_toolsets,
++        _resolve_cron_disabled_toolsets,
++    )
++
++    from cron.jobs import _normalize_job_service_tier, _normalize_job_allow_fallbacks
++
++    tier = _normalize_job_service_tier(job.get("service_tier"))
++    allow_fallbacks = _normalize_job_allow_fallbacks(job.get("allow_fallbacks"))
++    tier_kwargs = (
++        {}
++        if tier is None
++        else {"service_tier": "priority" if tier == "priority" else None}
++    )
++    runtime = setup.runtime
++    request_overrides = runtime.get("request_overrides")
++    if tier is not None:
++        request_overrides = dict(request_overrides or {})
++        for key in ("service_tier", "speed"):
++            request_overrides.pop(key, None)
++        if isinstance(request_overrides.get("extra_body"), dict):
++            body = dict(request_overrides["extra_body"])
++            for key in ("service_tier", "speed"):
++                body.pop(key, None)
++            request_overrides["extra_body"] = body
++        if tier == "priority":
++            from hermes_cli.models import resolve_fast_mode_overrides
++
++            fast = resolve_fast_mode_overrides(
++                setup.model,
++                provider=runtime.get("provider"),
++                base_url=runtime.get("base_url"),
++            )
++            if not fast:
++                raise ValueError(
++                    "Cron service_tier priority is unsupported by the selected route"
++                )
++            request_overrides.update(fast)
++    pr = _cfg.get("provider_routing") or {}
++    agent = AIAgent(
++        model=setup.model,
++        api_key=runtime.get("api_key"),
++        base_url=runtime.get("base_url"),
++        provider=runtime.get("provider"),
++        requested_provider=runtime.get("requested_provider"),
++        api_mode=runtime.get("api_mode"),
++        request_overrides=request_overrides,
++        acp_command=runtime.get("command"),
++        acp_args=runtime.get("args"),
++        max_iterations=setup.max_iterations,
++        reasoning_config=setup.reasoning_config,
++        prefill_messages=setup.prefill_messages,
++        fallback_model=[] if allow_fallbacks is False else setup.fallback_model,
++        **tier_kwargs,
++        credential_pool=setup.credential_pool,
++        providers_allowed=pr.get("only"),
++        providers_ignored=pr.get("ignore"),
++        providers_order=pr.get("order"),
++        provider_sort=pr.get("sort"),
++        openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get(
++            "min_coding_score"
++        ),
++        enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
++        disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
++        quiet_mode=True,
++        # Project context files only with a configured workdir; SOUL.md always.
++        skip_context_files=not bool(workdir),
++        load_soul_identity=True,
++        skip_memory=True,
++        skip_background_review=skip_background_review,
++        platform="cron",
++        session_id=session_id,
++        session_db=session_db,
++    )
++
++    from agent.service_tier_policy import capture_request_owner
++
++    capture_request_owner(
++        agent,
++        kind="cron",
++        identity=str(job.get("id") or ""),
++        job_name=str(job.get("name") or ""),
++    )
++    return agent
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index b2e4efe841..e512afc85e 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -48,7 +48,7 @@ from tools.cronjob_job_args import (
+     _apply_continuity,
+     _canonical_skills,
+     _clean_str_list,
+-    _format_job,
++    _format_job as _native_format_job,
+     _gateway_liveness_notice,
+     _local_delivery_notice,
+     _mode_guidance_notes,
+@@ -65,6 +65,12 @@ from tools.cronjob_job_args import (
+ from tools.registry import registry, tool_error
+ 
+ 
++def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
++    result = _native_format_job(job)
++    result.update(service_tier=job.get("service_tier"), allow_fallbacks=job.get("allow_fallbacks"))
++    return result
++
++
+ def _dumps(payload: Dict[str, Any]) -> str:
+     return json.dumps(payload, indent=2)
+ 
+@@ -618,6 +624,7 @@ def _action_create(a: Dict[str, Any]) -> str:
+             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
+             reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
+             pinned=bool(a["pinned"]),
++            service_tier=a["service_tier"], allow_fallbacks=a["allow_fallbacks"],
+             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
+                if a["paused"] is not False or a["paused_reason"] is not None else {}))
+@@ -775,6 +782,9 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
+     if a["interpreter"] is not None:
+         # CLI-only lane like reasoning_effort; update_job trims, empty string clears.
+         updates["interpreter"] = a["interpreter"]
++    for field in ("service_tier", "allow_fallbacks"):
++        if a[field] is not None:
++            updates[field] = a[field]
+     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
+     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
+     # schedulable. Merging this update over the stored job lets an operator remediate.
+@@ -930,7 +940,10 @@ def cronjob(
+     paused: bool = False,
+     paused_reason: Optional[str] = None,
+     pinned: Optional[bool] = None,
+-    interpreter: Optional[str] = None) -> str:
++    interpreter: Optional[str] = None,
++    *,
++    service_tier: Optional[str] = None,
++    allow_fallbacks: Optional[bool] = None) -> str:
+     """Unified cron job management tool."""
+     a = dict(locals())
+     del a["task_id"]  # unused but kept for handler signature compatibility
+@@ -1023,6 +1036,15 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
+                 "items": {"type": "string"},
+                 "description": "Optional ordered skill names loaded before the cron prompt. On update, [] clears."
+             },
++            "service_tier": {
++                "type": "string",
++                "enum": ["normal", "priority", ""],
++                "description": "Optional per-job service tier. Priority requires provider/model support. Omit to inherit; on update an empty string clears the pin."
++            },
++            "allow_fallbacks": {
++                "type": "boolean",
++                "description": "False prevents both initial-provider and agent fallback for this job. Omit to inherit the existing policy."
++            },
+             "script": {
+                 "type": "string",
+                 "description": _script_description("the profile HERMES_HOME")
+@@ -1086,7 +1108,7 @@ def check_cronjob_requirements() -> bool:
+ _HANDLER_FORWARDED_ARGS = (
+     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
+     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
+-    "paused_reason", "pinned")
++    "paused_reason", "pinned", "service_tier", "allow_fallbacks")
+ 
+ 
+ def _cronjob_handler(args, **kw):

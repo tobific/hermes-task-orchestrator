@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tobific <tobific@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH 6/8] seam: gateway_agents / gateway_busy_control hooks
+ (experimental)
+
+Adds two VALID_HOOKS entries and a /agents consumer in
+gateway/slash_commands_status.py that appends bounded, owner-scoped plugin
+projections (task status) to the native output.
+
+Experimental, built against Hermes 8a3ede1b.
+---
+ gateway/slash_commands_status.py | 39 ++++++++++++++++++++++++++++++++
+ hermes_cli/plugins.py            |  8 ++++---
+ 2 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/gateway/slash_commands_status.py b/gateway/slash_commands_status.py
+index eb534963f8..15da623810 100644
+--- a/gateway/slash_commands_status.py
++++ b/gateway/slash_commands_status.py
+@@ -432,6 +432,42 @@ class GatewayStatusCommandsMixin:
+             return _resolve_gateway_model_context(model_name or None, route)
+         return await _quiet(lambda: asyncio.to_thread(_resolve))
+ 
++    async def _agents_plugin_lines(self, session_key):
++        """Append bounded plugin projections using only the gateway's current route identity."""
++        try:
++            from hermes_cli.plugins import has_hook, invoke_hook
++            from hermes_constants import get_hermes_home
++
++            if not has_hook("gateway_agents"):
++                return []
++            entry = self.session_store.lookup_by_session_key(session_key)
++            session_id = getattr(entry, "session_id", None)
++            if not isinstance(session_id, str) or not session_id:
++                return []
++            results = invoke_hook(
++                "gateway_agents",
++                session_key=session_key,
++                session_id=session_id,
++                profile=str(get_hermes_home().resolve()),
++            )
++            lines = []
++            for result in results or []:
++                if not isinstance(result, dict) or not isinstance(
++                    result.get("lines"), list
++                ):
++                    continue
++                for line in result["lines"]:
++                    if isinstance(line, str) and line.strip():
++                        lines.append(_clip(line.replace("\n", " "), 320))
++                        if len(lines) >= 50:
++                            return lines
++            return lines
++        except Exception:
++            logger.warning(
++                "Agent projection hook failed; native output retained", exc_info=True
++            )
++            return []
++
+     async def _handle_agents_command(self, event: MessageEvent) -> str:
+         """Handle /agents command - list active agents and running tasks."""
+         from gateway.run import _AGENT_PENDING_SENTINEL
+@@ -485,6 +521,9 @@ class GatewayStatusCommandsMixin:
+             lines += _capped_rows(delegations, _agents_delegation_lines)
+         if not (agent_rows or running_processes or background_tasks or delegations):
+             lines += ["", t("gateway.agents.none")]
++        plugin_lines = await self._agents_plugin_lines(current_session_key)
++        if plugin_lines:
++            lines += ["", *plugin_lines]
+         return "\n".join(lines)
+ 
+     async def _handle_topup_command(self, event: MessageEvent) -> str:
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 7e007ea573..4e945dbd75 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -137,9 +137,11 @@ VALID_HOOKS: Set[str] = {
+     # auth/pairing and dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
+     # "reason"} -> drop; {"action": "rewrite", "text"} -> replace event.text; "allow"/None -> normal.
+     "pre_gateway_dispatch",
+-    # agent_loop_stopped: an agent turn was interrupted mid-run (/stop, or the running-agent
+-    # fast-path of /new; see gateway/run.py::_interrupt_and_clear_session). Kwargs: session_key,
+-    # platform, reason, invalidation_reason. Return values are ignored.
++    # Bounded command projection; returns {lines: list[str]} for the trusted current route.
++    "gateway_agents",
++    # After busy-event auth/admission: pure {action: resume, reason: str} decision.
++    "gateway_busy_control",
++    # agent_loop_stopped: an agent turn was interrupted mid-run; return values are ignored.
+     "agent_loop_stopped",
+     # Approval observers (tools/approval.py); returns ignored — plugins cannot veto or pre-answer
+     # (use pre_tool_call). Kwargs: command, description, pattern_key, pattern_keys, session_key,

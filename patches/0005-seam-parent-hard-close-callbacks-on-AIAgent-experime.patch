@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tobific <tobific@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH 5/8] seam: parent hard-close callbacks on AIAgent
+ (experimental)
+
+run_agent.py: is_closed, register_close_callback and _notify_hard_close let
+an orchestrator revoke a parent's workers when that parent agent is
+hard-closed.
+
+Experimental, built against Hermes 8a3ede1b.
+---
+ run_agent.py | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/run_agent.py b/run_agent.py
+index bf863c5871..e06ec4a6a1 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -307,6 +307,9 @@ class AIAgent(
+         if tool_delay is not None:
+             warnings.warn("tool_delay is deprecated and ignored; sequential tool calls "
+                           "no longer sleep between executions.", DeprecationWarning, stacklevel=2)
++        self._close_notification_lock = threading.RLock()
++        self._hard_closed = False
++        self._close_callbacks = []
+         from agent.agent_init import init_agent
+         init_agent(self, **init_kwargs)
+ 
+@@ -961,9 +964,39 @@ class AIAgent(
+         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
+         _quietly(self._close_codex_session)
+ 
++    @property
++    def is_closed(self) -> bool:
++        """Whether hard close has begun on this exact instance, not client eviction."""
++        return getattr(self, "_hard_closed", False)
++
++    def register_close_callback(self, callback: Callable[[], None]) -> None:
++        """Observe hard close once per registration; late observers run immediately.
++
++        Callbacks run outside the registration lock and before resource cleanup.
++        They must be short and nonblocking. Exceptions do not veto cleanup.
++        This is instance-scoped, never session-ID-scoped or a turn-end event.
++        """
++        if not callable(callback):
++            raise TypeError("close callback must be callable")
++        with self._close_notification_lock:
++            if not self._hard_closed:
++                self._close_callbacks.append(callback)
++                return
++        _quietly(callback)
++
++    def _notify_hard_close(self) -> None:
++        with self._close_notification_lock:
++            if self._hard_closed:
++                return
++            self._hard_closed = True
++            callbacks, self._close_callbacks = self._close_callbacks, []
++        for callback in callbacks:
++            _quietly(callback)
++
+     def close(self) -> None:
+         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
+         blocks the rest."""
++        _quietly(self._notify_hard_close)
+         # close() is the hard owner boundary; shutdown_memory_provider() is idempotent so gateway pre-calls
+         # never double-extract.
+         session_messages = getattr(self, "_session_messages", None)

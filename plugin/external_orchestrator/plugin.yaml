@@ -1,0 +1,19 @@
+name: external-orchestrator
+version: experimental
+# User plugin, installed outside the Hermes core. It REQUIRES Hermes 8a3ede1b with the 8 core patches in
+# patches/ applied (see README). Linux and macOS only (POSIX file locks).
+description: "External plugin-owned task orchestration with durable packets, bounded scheduling, and parent delivery."
+author: "tobific"
+kind: standalone
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - orchestration_create
+  - orchestration_enqueue
+  - orchestration_supersede
+  - orchestration_join
+  - orchestration_collect
+  - orchestration_cancel
+  - orchestration_status
+  - orchestration_history

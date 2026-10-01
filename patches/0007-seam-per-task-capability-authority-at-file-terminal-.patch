@@ -1,0 +1,1117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tobific <tobific@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH 7/8] seam: per-task capability authority at file/terminal
+ effects (experimental)
+
+agent/delegation_context.py carries a DelegationIdentity (run, task,
+generation, write scope, capability profile) set by the orchestrator;
+file tools, execute_code, the local environment and the terminal tool
+enforce it at the actual effect. tools/delegation_contracts.py holds the
+shared capability profiles. With no identity set, nothing changes.
+
+Experimental, built against Hermes 8a3ede1b.
+---
+ agent/delegation_context.py   | 154 ++++++-
+ tools/code_execution_tool.py  |   6 +
+ tools/delegation_contracts.py | 759 ++++++++++++++++++++++++++++++++++
+ tools/environments/local.py   |   5 +
+ tools/file_tools.py           |  33 ++
+ tools/process_registry.py     |   5 +
+ tools/terminal_tool.py        |   2 +
+ 7 files changed, 960 insertions(+), 4 deletions(-)
+ create mode 100644 tools/delegation_contracts.py
+
+diff --git a/agent/delegation_context.py b/agent/delegation_context.py
+index fac7fb638c..52d6471e21 100644
+--- a/agent/delegation_context.py
++++ b/agent/delegation_context.py
+@@ -8,6 +8,8 @@ closed for them without mutating the process-global environment.
+ from __future__ import annotations
+ 
+ import os
++from dataclasses import dataclass
++from pathlib import Path
+ from contextlib import contextmanager
+ from contextvars import ContextVar, Token
+ from typing import Iterator, Mapping, MutableMapping, overload
+@@ -26,17 +28,51 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
+ 
+ 
+ @contextmanager
+-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
+-    """Mark child execution and isolate its task-local session identity. Even a context
+-    entered without an id must restore the parent's session ContextVar (child
+-    construction calls ``set_current_session_id``)."""
++def delegated_child_context(
++    session_id: str | None = None,
++    *,
++    run_id: str | None = None,
++    task_id: str | None = None,
++    generation: int | None = None,
++    write_owner_token: str | None = None,
++    write_scope: tuple[str, ...] | None = None,
++    capability_profile: str | None = None,
++) -> Iterator[None]:
++    """Mark child execution and isolate its task-local session identity.
++
++    Child construction calls ``set_current_session_id`` internally, so even a
++    context entered without an id must restore the parent's ContextVar.  Child
++    execution passes its explicit id and receives it only for this scope.
++    """
+     token = _DELEGATED_CHILD_CONTEXT.set(True)
++    previous = _DELEGATION_IDENTITY.get()
++    identity_token = _DELEGATION_IDENTITY.set(
++        DelegationIdentity(
++            run_id=previous.run_id if run_id is None else str(run_id),
++            task_id=previous.task_id if task_id is None else str(task_id),
++            generation=previous.generation if generation is None else int(generation),
++            write_owner_token=(
++                previous.write_owner_token
++                if write_owner_token is None
++                else str(write_owner_token)
++            ),
++            write_scope=previous.write_scope
++            if write_scope is None
++            else tuple(write_scope),
++            capability_profile=(
++                previous.capability_profile
++                if capability_profile is None
++                else str(capability_profile)
++            ),
++        )
++    )
+     try:
+         from gateway.session_context import scoped_current_session_id  # lazy: it calls is_delegated_child_context()
+ 
+         with scoped_current_session_id(session_id):
+             yield
+     finally:
++        _DELEGATION_IDENTITY.reset(identity_token)
+         _DELEGATED_CHILD_CONTEXT.reset(token)
+ 
+ 
+@@ -162,3 +198,113 @@ def delegated_child_subprocess_env(
+             or (env and (env.get("HERMES_KANBAN_TASK") or env.get(DELEGATED_CHILD_ENV_MARKER)))):
+         return None if env is None else dict(env)
+     return scrub_kanban_env(os.environ if env is None else env)
++
++
++# Approved external coordinator ownership and capability state.
++@dataclass(frozen=True)
++class DelegationIdentity:
++    run_id: str = ""
++    task_id: str = ""
++    generation: int = 0
++    write_owner_token: str = ""
++    write_scope: tuple[str, ...] = ()
++    capability_profile: str = ""
++
++
++_DELEGATION_IDENTITY: ContextVar[DelegationIdentity] = ContextVar(
++    "hermes_delegation_identity", default=DelegationIdentity()
++)
++
++
++_DELEGATED_FILE_EFFECT: ContextVar[bool] = ContextVar(
++    "hermes_delegated_file_effect", default=False
++)
++
++
++def get_delegation_identity() -> DelegationIdentity:
++    """Return immutable task/run/write ownership for the active child."""
++    return _DELEGATION_IDENTITY.get()
++
++
++@contextmanager
++def delegated_file_effect_context() -> Iterator[None]:
++    """Allow internal file-tool subprocesses after their target was authorized."""
++    token = _DELEGATED_FILE_EFFECT.set(True)
++    try:
++        yield
++    finally:
++        _DELEGATED_FILE_EFFECT.reset(token)
++
++
++class DelegationScopeError(PermissionError):
++    """An adaptive worker attempted an effect outside its trusted packet."""
++
++
++def authorize_delegated_tool(tool_name: str) -> None:
++    """Enforce the packet capability at dispatch, not merely in its schema."""
++    identity = get_delegation_identity()
++    if not identity.run_id:
++        return
++    from tools.delegation_contracts import CAPABILITY_TOOL_ALLOWLISTS, CapabilityProfile
++
++    try:
++        allowed = CAPABILITY_TOOL_ALLOWLISTS[CapabilityProfile(identity.capability_profile)]
++    except (ValueError, KeyError):
++        allowed = frozenset()
++    if not isinstance(tool_name, str) or tool_name not in allowed:
++        raise DelegationScopeError(
++            f"Tool {tool_name!r} is not authorized for {identity.capability_profile!r}. "
++            "Do not retry or use GUI/browser/MCP alternatives. Return needs_parent_decision "
++            "with completed work and the required parent-run action."
++        )
++
++
++def _contains_path(scope: str, target: str | Path) -> bool:
++    scope_path = Path(scope).expanduser().resolve(strict=False)
++    target_path = Path(target).expanduser().resolve(strict=False)
++    try:
++        return os.path.commonpath((str(scope_path), str(target_path))) == str(
++            scope_path
++        )
++    except ValueError:
++        return False
++
++
++def authorize_delegated_write(path: str | Path) -> None:
++    """Authorize one concrete file target for a trusted adaptive worker."""
++
++    identity = get_delegation_identity()
++    if not identity.run_id:
++        return
++    if identity.capability_profile != "workspace-write":
++        raise DelegationScopeError(
++            f"capability profile {identity.capability_profile!r} cannot mutate files"
++        )
++    if not identity.write_owner_token or not identity.write_scope:
++        raise DelegationScopeError("adaptive write requires an owned write scope")
++    if not any(_contains_path(scope, path) for scope in identity.write_scope):
++        raise DelegationScopeError(
++            f"write target is outside the delegated scope: {Path(path)}"
++        )
++
++
++def authorize_delegated_terminal(
++    command: str, *, cwd: str | Path, background: bool = False
++) -> None:
++    """Deny adaptive terminal use unless a real execution sandbox is installed.
++
++    The local terminal ultimately executes through a shell, so token/path
++    classification cannot prove nested or expansion-time effects. Adaptive
++    packets therefore receive no terminal authority. Host-owned file tools may
++    still use their narrowly scoped internal subprocess lane after authorizing
++    the concrete file target.
++    """
++
++    identity = get_delegation_identity()
++    if not identity.run_id:
++        return
++    if _DELEGATED_FILE_EFFECT.get():
++        return
++    raise DelegationScopeError(
++        "adaptive terminal is disabled because no verified OS execution sandbox is installed"
++    )
+diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
+index eeb8a475df..82ffb8aaea 100644
+--- a/tools/code_execution_tool.py
++++ b/tools/code_execution_tool.py
+@@ -706,6 +706,12 @@ def execute_code(
+     the security envelope (env scrubbing, tool whitelist + call budget, output redaction), not an
+     isolation jail: default `project` mode runs in the session's cwd with the project venv.
+     ``enabled_tools`` ∩ SANDBOX_ALLOWED_TOOLS; ``reset`` kills the existing kernel first."""
++    try:
++        from agent.delegation_context import authorize_delegated_tool
++
++        authorize_delegated_tool("execute_code")
++    except PermissionError as exc:
++        return json.dumps({"status": "blocked", "error": str(exc)})
+     if not SANDBOX_AVAILABLE:
+         return tool_error("execute_code sandbox is unavailable in this environment. "
+                           "Use normal tool calls (terminal, read_file, write_file, ...) instead.")
+diff --git a/tools/delegation_contracts.py b/tools/delegation_contracts.py
+new file mode 100644
+index 0000000000..e9542eadd1
+--- /dev/null
++++ b/tools/delegation_contracts.py
+@@ -0,0 +1,759 @@
++"""Pure contracts and state-machine rules for adaptive delegation."""
++
++from __future__ import annotations
++
++from dataclasses import asdict, dataclass, field, is_dataclass
++from enum import Enum
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++from typing import Any, Iterable, Mapping, Sequence
++
++
++DEFAULT_MAX_RESULT_CHARS = 14_000
++
++
++class ContractError(ValueError):
++    pass
++
++
++_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
++
++
++class _ValueEnum(str, Enum):
++    def __str__(self) -> str:
++        return self.value
++
++
++class TaskKind(_ValueEnum):
++    INSPECT = "inspect"
++    RESEARCH = "research"
++    EXTRACT = "extract"
++    EXECUTE = "execute"
++    EDIT = "edit"
++    TEST = "test"
++    REVIEW = "review"
++    SUMMARIZE = "summarize"
++
++
++class Effort(_ValueEnum):
++    AUTO = "auto"
++    LOW = "low"
++    MEDIUM = "medium"
++    HIGH = "high"
++    XHIGH = "xhigh"
++    MAX = "max"
++
++
++class Speed(_ValueEnum):
++    AUTO = "auto"
++    STANDARD = "standard"
++    FAST = "fast"
++
++
++class Priority(_ValueEnum):
++    CRITICAL = "critical"
++    SUPPORT = "support"
++    BACKGROUND = "background"
++
++
++class CapabilityProfile(_ValueEnum):
++    NONE = "none"
++    READ_ONLY = "read-only"
++    WEB_READ = "web-read"
++    CODE_READ = "code-read"
++    CODE_READ_TEST = "code-read-test"
++    WORKSPACE_WRITE = "workspace-write"
++    COMPUTER_USE = "computer-use"
++
++
++class TaskState(_ValueEnum):
++    BLOCKED = "blocked"
++    READY = "ready"
++    RUNNING = "running"
++    SUCCEEDED = "succeeded"
++    FAILED = "failed"
++    CANCELLED = "cancelled"
++    EXPIRED = "expired"
++    SUPERSEDED = "superseded"
++    ABANDONED = "abandoned"
++    INTERRUPTED = "interrupted"
++
++
++class RunState(_ValueEnum):
++    OPEN = "open"
++    JOINING = "joining"
++    COMPLETE = "complete"
++    PARTIAL = "partial"
++    FAILED = "failed"
++    CANCELLED = "cancelled"
++    ABANDONED = "abandoned"
++    INTERRUPTED = "interrupted"
++
++
++class HostExecutionStatus(_ValueEnum):
++    COMPLETED = "completed"
++    ERROR = "error"
++    TIMEOUT = "timeout"
++    CANCELLED = "cancelled"
++    INTERRUPTED = "interrupted"
++    ABANDONED = "abandoned"
++
++
++class WorkerStatus(_ValueEnum):
++    PASS = "pass"
++    NEEDS_PARENT_DECISION = "needs_parent_decision"
++    RETRYABLE_FAILURE = "retryable_failure"
++    TERMINAL_FAILURE = "terminal_failure"
++
++
++TERMINAL_TASK_STATES = frozenset({
++    TaskState.SUCCEEDED,
++    TaskState.FAILED,
++    TaskState.CANCELLED,
++    TaskState.EXPIRED,
++    TaskState.SUPERSEDED,
++    TaskState.ABANDONED,
++    TaskState.INTERRUPTED,
++})
++
++TERMINAL_RUN_STATES = frozenset({
++    RunState.COMPLETE,
++    RunState.FAILED,
++    RunState.CANCELLED,
++    RunState.ABANDONED,
++    RunState.INTERRUPTED,
++})
++
++_TASK_TRANSITIONS = {
++    TaskState.BLOCKED: {
++        TaskState.READY,
++        # Dependency resolution can terminalize a task before it is ever
++        # runnable (unknown dependency or a dependency that did not succeed).
++        TaskState.FAILED,
++        TaskState.CANCELLED,
++        TaskState.SUPERSEDED,
++        TaskState.ABANDONED,
++    },
++    TaskState.READY: {
++        TaskState.RUNNING,
++        TaskState.CANCELLED,
++        TaskState.EXPIRED,
++        TaskState.SUPERSEDED,
++        TaskState.ABANDONED,
++    },
++    TaskState.RUNNING: {
++        TaskState.SUCCEEDED,
++        TaskState.FAILED,
++        TaskState.CANCELLED,
++        TaskState.EXPIRED,
++        TaskState.SUPERSEDED,
++        TaskState.ABANDONED,
++        TaskState.INTERRUPTED,
++    },
++}
++_RUN_TRANSITIONS = {
++    RunState.OPEN: {
++        RunState.JOINING,
++        RunState.COMPLETE,
++        RunState.PARTIAL,
++        RunState.FAILED,
++        RunState.CANCELLED,
++        RunState.ABANDONED,
++        RunState.INTERRUPTED,
++    },
++    RunState.JOINING: {
++        RunState.OPEN,
++        RunState.COMPLETE,
++        RunState.PARTIAL,
++        RunState.FAILED,
++        RunState.CANCELLED,
++        RunState.ABANDONED,
++        RunState.INTERRUPTED,
++    },
++    # A partial run can still finish after optional/remaining work completes.
++    RunState.PARTIAL: {
++        RunState.OPEN,
++        RunState.COMPLETE,
++        RunState.FAILED,
++        RunState.CANCELLED,
++        RunState.ABANDONED,
++        RunState.INTERRUPTED,
++    },
++    # A failed run may be explicitly reopened only by a parent-authorized supersede.
++    RunState.FAILED: {
++        RunState.OPEN,
++    },
++}
++
++
++def validate_task_transition(before: TaskState, after: TaskState) -> None:
++    if before == after:
++        return
++    if after not in _TASK_TRANSITIONS.get(before, set()):
++        raise ContractError(f"invalid task transition: {before.value} -> {after.value}")
++
++
++def validate_run_transition(before: RunState, after: RunState) -> None:
++    if before == after:
++        return
++    if after not in _RUN_TRANSITIONS.get(before, set()):
++        raise ContractError(f"invalid run transition: {before.value} -> {after.value}")
++
++
++def host_status_to_task_state(status: HostExecutionStatus) -> TaskState:
++    return {
++        HostExecutionStatus.COMPLETED: TaskState.SUCCEEDED,
++        HostExecutionStatus.ERROR: TaskState.FAILED,
++        HostExecutionStatus.TIMEOUT: TaskState.EXPIRED,
++        HostExecutionStatus.CANCELLED: TaskState.CANCELLED,
++        HostExecutionStatus.INTERRUPTED: TaskState.INTERRUPTED,
++        HostExecutionStatus.ABANDONED: TaskState.ABANDONED,
++    }[status]
++
++
++def _json_value(value: Any) -> Any:
++    if isinstance(value, Enum):
++        return value.value
++    if is_dataclass(value):
++        return {key: _json_value(item) for key, item in asdict(value).items()}
++    if isinstance(value, Mapping):
++        return {str(key): _json_value(item) for key, item in value.items()}
++    if isinstance(value, (tuple, list, set, frozenset)):
++        return [_json_value(item) for item in value]
++    return value
++
++
++def stable_json_dumps(value: Any) -> str:
++    return json.dumps(
++        _json_value(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
++    )
++
++
++def _enum(enum_type: type[_ValueEnum], value: Any, default: _ValueEnum) -> _ValueEnum:
++    raw = str(value or default.value).strip().lower()
++    try:
++        return enum_type(raw)
++    except ValueError as exc:
++        allowed = ", ".join(item.value for item in enum_type)
++        raise ContractError(
++            f"invalid {enum_type.__name__}: {raw!r}; expected {allowed}"
++        ) from exc
++
++
++def _boolean(value: Mapping[str, Any], name: str, default: bool) -> bool:
++    if name not in value:
++        return default
++    parsed = value[name]
++    if not isinstance(parsed, bool):
++        raise ContractError(f"task {name} must be a boolean")
++    return parsed
++
++
++def canonical_scope(path: str) -> str:
++    raw = os.path.expanduser(str(path or "").strip())
++    if not raw:
++        raise ContractError("write_scope entries must be non-empty paths")
++    return os.path.normcase(os.path.realpath(os.path.abspath(raw)))
++
++
++def scopes_overlap(left: str, right: str) -> bool:
++    a, b = canonical_scope(left), canonical_scope(right)
++    try:
++        return os.path.commonpath((a, b)) in {a, b}
++    except ValueError:
++        return False
++
++
++def write_scopes_overlap(left: Iterable[str], right: Iterable[str]) -> bool:
++    return any(scopes_overlap(a, b) for a in left for b in right)
++
++
++CAPABILITY_TOOL_ALLOWLISTS: Mapping[CapabilityProfile, frozenset[str]] = {
++    CapabilityProfile.NONE: frozenset(),
++    CapabilityProfile.READ_ONLY: frozenset({"read_file", "search_files"}),
++    CapabilityProfile.WEB_READ: frozenset({"web_search", "web_extract"}),
++    CapabilityProfile.CODE_READ: frozenset({"read_file", "search_files"}),
++    CapabilityProfile.CODE_READ_TEST: frozenset({
++        "read_file",
++        "search_files",
++    }),
++    CapabilityProfile.WORKSPACE_WRITE: frozenset({
++        "read_file",
++        "search_files",
++        "write_file",
++        "patch",
++    }),
++    CapabilityProfile.COMPUTER_USE: frozenset({"computer_use"}),
++}
++
++
++@dataclass(frozen=True)
++class TaskSpec:
++    id: str
++    goal: str
++    context: str = ""
++    kind: TaskKind = TaskKind.INSPECT
++    effort: Effort = Effort.AUTO
++    speed: Speed = Speed.AUTO
++    priority: Priority = Priority.SUPPORT
++    required: bool = True
++    depends_on: tuple[str, ...] = ()
++    acceptance: str = ""
++    evidence_scope: str = ""
++    capability_profile: CapabilityProfile = CapabilityProfile.READ_ONLY
++    write_scope: tuple[str, ...] = ()
++    deadline_seconds: int = 300
++    dedupe_key: str = ""
++    idempotent: bool = True
++
++    @classmethod
++    def from_dict(cls, value: Mapping[str, Any], *, index: int = 0) -> "TaskSpec":
++        if not isinstance(value, Mapping):
++            raise ContractError("task must be an object")
++        goal = str(value.get("goal") or "").strip()
++        if not goal:
++            raise ContractError("task goal is required")
++        explicit_id = str(value.get("id") or "").strip()
++        if explicit_id:
++            if not _TASK_ID_RE.fullmatch(explicit_id):
++                raise ContractError(
++                    "task id must be 1-64 ASCII letters, digits, dot, underscore, or hyphen"
++                )
++            task_id = explicit_id
++        else:
++            identity = stable_json_dumps({
++                key: item for key, item in value.items() if key != "id"
++            })
++            digest = hashlib.sha256(f"{index}:{identity}".encode("utf-8")).hexdigest()[
++                :12
++            ]
++            task_id = f"task-{digest}"
++        raw_depends = value.get("depends_on") or ()
++        if isinstance(raw_depends, (str, bytes)) or not isinstance(
++            raw_depends, Sequence
++        ):
++            raise ContractError(f"task {task_id!r} depends_on must be an array")
++        depends = tuple(str(item).strip() for item in raw_depends)
++        if any(not item for item in depends):
++            raise ContractError(f"task {task_id!r} has an empty dependency")
++        scope_values = value.get("write_scope") or ()
++        if isinstance(scope_values, (str, bytes)) or not isinstance(
++            scope_values, Sequence
++        ):
++            raise ContractError(f"task {task_id!r} write_scope must be an array")
++        raw_scopes = tuple(canonical_scope(item) for item in scope_values)
++        deadline = value.get("deadline_seconds", 300)
++        if (
++            isinstance(deadline, bool)
++            or not isinstance(deadline, int)
++            or not 1 <= deadline <= 86400
++        ):
++            raise ContractError(
++                f"task {task_id!r} deadline_seconds must be in [1, 86400]"
++            )
++        profile = _enum(
++            CapabilityProfile,
++            value.get("capability_profile"),
++            CapabilityProfile.READ_ONLY,
++        )
++        if raw_scopes and profile is not CapabilityProfile.WORKSPACE_WRITE:
++            raise ContractError(
++                f"task {task_id!r} declares write_scope without workspace-write capability"
++            )
++        if profile is CapabilityProfile.WORKSPACE_WRITE and not raw_scopes:
++            raise ContractError(
++                f"task {task_id!r} workspace-write capability requires a non-empty write_scope"
++            )
++        return cls(
++            id=task_id,
++            goal=goal,
++            context=str(value.get("context") or ""),
++            kind=_enum(TaskKind, value.get("kind"), TaskKind.INSPECT),
++            effort=_enum(Effort, value.get("effort"), Effort.AUTO),
++            speed=_enum(Speed, value.get("speed"), Speed.AUTO),
++            priority=_enum(Priority, value.get("priority"), Priority.SUPPORT),
++            required=_boolean(value, "required", True),
++            depends_on=depends,
++            acceptance=str(value.get("acceptance") or ""),
++            evidence_scope=str(value.get("evidence_scope") or "").strip(),
++            capability_profile=profile,
++            write_scope=raw_scopes,
++            deadline_seconds=deadline,
++            dedupe_key=str(value.get("dedupe_key") or "").strip(),
++            idempotent=_boolean(value, "idempotent", True),
++        )
++
++
++@dataclass(frozen=True)
++class RoutePin:
++    provider: str = "openai-codex"
++    model: str = "gpt-6-luna"
++    base_url: str = "https://chatgpt.com/backend-api/codex"
++    api_mode: str = "codex_responses"
++    allow_fallbacks: bool = False
++
++
++@dataclass(frozen=True)
++class TaskPacket:
++    run_id: str
++    task_id: str
++    generation: int
++    parent_session_id: str
++    parent_turn_id: str
++    objective: str
++    context: str
++    acceptance: str
++    dependencies: tuple[str, ...]
++    required: bool
++    kind: TaskKind
++    effort: Effort
++    speed: Speed
++    priority: Priority
++    capability_profile: CapabilityProfile
++    tool_allowlist: tuple[str, ...]
++    write_scope: tuple[str, ...]
++    write_owner_token: str
++    deadline_seconds: int
++    iteration_budget: int
++    dedupe_key: str
++    idempotent: bool
++    max_packet_tokens: int
++    max_result_chars: int
++    route: RoutePin = field(default_factory=RoutePin)
++
++    @classmethod
++    def from_spec(
++        cls,
++        spec: TaskSpec,
++        *,
++        run_id: str,
++        parent_session_id: str,
++        parent_turn_id: str,
++        generation: int = 1,
++        max_packet_tokens: int = 12000,
++        max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
++    ) -> "TaskPacket":
++        run_id = str(run_id or "").strip()
++        if not _TASK_ID_RE.fullmatch(run_id):
++            raise ContractError(
++                "run_id must be 1-64 ASCII letters, digits, dot, underscore, or hyphen"
++            )
++        effort = resolve_effort(spec)
++        iteration_budget = {
++            Effort.LOW: 8,
++            Effort.MEDIUM: 20,
++            Effort.HIGH: 40,
++            Effort.XHIGH: 60,
++            Effort.MAX: 60,
++        }[effort]
++        speed = resolve_speed(spec)
++        owner_material = (
++            f"{run_id}\0{spec.id}\0{generation}\0{stable_json_dumps(spec.write_scope)}"
++        )
++        owner = hashlib.sha256(owner_material.encode("utf-8")).hexdigest()
++        packet = cls(
++            run_id=run_id,
++            task_id=spec.id,
++            generation=generation,
++            parent_session_id=parent_session_id,
++            parent_turn_id=parent_turn_id,
++            objective=spec.goal,
++            context=spec.context,
++            acceptance=spec.acceptance,
++            dependencies=spec.depends_on,
++            required=spec.required,
++            kind=spec.kind,
++            effort=effort,
++            speed=speed,
++            priority=spec.priority,
++            capability_profile=spec.capability_profile,
++            tool_allowlist=tuple(
++                sorted(CAPABILITY_TOOL_ALLOWLISTS[spec.capability_profile])
++            ),
++            write_scope=spec.write_scope,
++            write_owner_token=owner,
++            # Maximum reasoning has the highest per-call cost. Bound wall time
++            # more tightly than other tiers so one worker cannot monopolize a
++            # scarce host-global lease for the task's full requested deadline.
++            deadline_seconds=min(spec.deadline_seconds, 180)
++            if effort is Effort.MAX
++            else spec.deadline_seconds,
++            iteration_budget=iteration_budget,
++            dedupe_key=spec.dedupe_key,
++            idempotent=spec.idempotent,
++            max_packet_tokens=max_packet_tokens,
++            max_result_chars=max_result_chars,
++        )
++        # Use Hermes' canonical estimator so CJK/code-heavy packets receive
++        # the same conservative accounting as direct Codex requests.
++        from agent.model_metadata import estimate_tokens_rough
++
++        estimate = max(1, int(estimate_tokens_rough(packet.worker_prompt())))
++        if estimate > max_packet_tokens:
++            raise ContractError(
++                f"task packet for {spec.id!r} is approximately {estimate} tokens; limit is {max_packet_tokens}"
++            )
++        return packet
++
++    def worker_prompt(self) -> str:
++        static = (
++            "You are a focused Hermes worker. Execute exactly one trusted task packet. "
++            "Do not widen scope, delegate, change route, or claim unverified effects. "
++            "Only allowed_tools are permitted. Missing tools: return needs_parent_decision "
++            "promptly. Shell/tests require parent execution; never bypass restrictions "
++            "through GUI/browser/MCP. "
++            "Return exactly this typed JSON shape: "
++            '{"status":"pass","answer":"string","evidence":["string"],'
++            '"artifacts":[],"checks":[],"uncertainties":["string"],'
++            '"suggested_followups":["string"]}. '
++            "Statuses: pass, needs_parent_decision, retryable_failure, terminal_failure. "
++            "All fields required; use [] when empty. For read-only inspection, checks "
++            "must be empty; passed checks need host evidence. JSON must fit "
++            "max_result_chars in characters and UTF-8 bytes. "
++            "Synthesize; never dump raw logs, unfiltered tool output, or duplicate "
++            "evidence. If content cannot fit, return a high-value subset with "
++            "needs_parent_decision and list omissions in uncertainties."
++        )
++        dynamic = {
++            "run_id": self.run_id,
++            "task_id": self.task_id,
++            "generation": self.generation,
++            "objective": self.objective,
++            "context": self.context,
++            "acceptance": self.acceptance,
++            "constraints": {
++                "capability_profile": self.capability_profile,
++                "allowed_tools": self.tool_allowlist,
++                "write_scope": self.write_scope,
++                "deadline_seconds": self.deadline_seconds,
++                "max_result_chars": self.max_result_chars,
++            },
++        }
++        return f"{static}\n\nTASK_PACKET\n{stable_json_dumps(dynamic)}"
++
++
++@dataclass(frozen=True)
++class WorkerCheck:
++    name: str
++    status: str
++    detail: str = ""
++
++
++@dataclass(frozen=True)
++class ArtifactClaim:
++    path: str = ""
++    url: str = ""
++    sha256: str = ""
++
++
++@dataclass(frozen=True)
++class WorkerResult:
++    status: WorkerStatus
++    answer: str
++    evidence: tuple[str, ...] = ()
++    artifacts: tuple[ArtifactClaim, ...] = ()
++    checks: tuple[WorkerCheck, ...] = ()
++    uncertainties: tuple[str, ...] = ()
++    suggested_followups: tuple[str, ...] = ()
++
++    @classmethod
++    def from_dict(cls, value: Mapping[str, Any]) -> "WorkerResult":
++        if not isinstance(value, Mapping):
++            raise ContractError("worker result must be an object")
++        required_fields = {
++            "status",
++            "answer",
++            "evidence",
++            "artifacts",
++            "checks",
++            "uncertainties",
++            "suggested_followups",
++        }
++        missing = sorted(required_fields - set(value))
++        if missing:
++            raise ContractError(
++                f"worker result missing required fields: {', '.join(missing)}"
++            )
++
++        def string_list(name: str) -> tuple[str, ...]:
++            raw = value.get(name)
++            if not isinstance(raw, list) or not all(
++                isinstance(item, str) for item in raw
++            ):
++                raise ContractError(f"worker result {name} must be an array of strings")
++            return tuple(raw)
++
++        raw_status = str(value.get("status") or "").strip().lower()
++        # Host execution uses "completed" while WorkerResult uses the semantic
++        # success state "pass". Accept the host's natural success word at this
++        # contract boundary, then serialize only the canonical worker status.
++        if raw_status == HostExecutionStatus.COMPLETED.value:
++            raw_status = WorkerStatus.PASS.value
++        status = _enum(WorkerStatus, raw_status, WorkerStatus.TERMINAL_FAILURE)
++        answer = str(value.get("answer") or "").strip()
++        if not answer:
++            raise ContractError("worker result answer is required")
++        checks: list[WorkerCheck] = []
++        raw_checks = value.get("checks")
++        if not isinstance(raw_checks, list):
++            raise ContractError("worker result checks must be an array")
++        for raw in raw_checks:
++            if isinstance(raw, str) and raw.strip():
++                # Low-effort workers sometimes put read/analysis notes in the
++                # checks list despite the typed prompt. Preserve the note but
++                # mark it skipped so it never masquerades as host verification.
++                checks.append(WorkerCheck("worker_note", "skipped", raw.strip()))
++                continue
++            if not isinstance(raw, Mapping) or not str(raw.get("name") or "").strip():
++                raise ContractError("worker result checks require a name")
++            check_status = str(raw.get("status") or "").strip().lower()
++            if check_status not in {"pass", "fail", "skipped"}:
++                raise ContractError(
++                    "worker result check status must be pass, fail, or skipped"
++                )
++            checks.append(
++                WorkerCheck(
++                    str(raw["name"]), check_status, str(raw.get("detail") or "")
++                )
++            )
++        artifacts: list[ArtifactClaim] = []
++        raw_artifacts = value.get("artifacts")
++        if not isinstance(raw_artifacts, list):
++            raise ContractError("worker result artifacts must be an array")
++        for raw in raw_artifacts:
++            if isinstance(raw, str):
++                if raw.startswith(("https://", "http://")):
++                    artifacts.append(ArtifactClaim(url=raw))
++                else:
++                    artifacts.append(ArtifactClaim(path=raw))
++            elif isinstance(raw, Mapping):
++                path = str(raw.get("path") or "").strip()
++                url = str(raw.get("url") or "").strip()
++                digest = str(raw.get("sha256") or "").strip().lower()
++                if bool(path) == bool(url):
++                    raise ContractError(
++                        "artifact claim requires exactly one of path or url"
++                    )
++                artifacts.append(ArtifactClaim(path=path, url=url, sha256=digest))
++            else:
++                raise ContractError(
++                    "worker result artifacts must be strings or objects"
++                )
++        return cls(
++            status=status,
++            answer=answer,
++            evidence=string_list("evidence"),
++            artifacts=tuple(artifacts),
++            checks=tuple(checks),
++            uncertainties=string_list("uncertainties"),
++            suggested_followups=string_list("suggested_followups"),
++        )
++
++
++@dataclass(frozen=True)
++class TaskExecutionOutcome:
++    host_status: HostExecutionStatus
++    raw_result: str
++    parsed_result: WorkerResult | None = None
++    route_proof: Mapping[str, Any] = field(default_factory=dict)
++    usage: Mapping[str, Any] = field(default_factory=dict)
++    artifacts: tuple[Mapping[str, Any], ...] = ()
++    validation_status: str = "pending"
++    validation_manifest: str = ""
++    raw_result_path: str = ""
++    parent_summary: str = ""
++    error: str = ""
++
++
++def resolve_effort(spec: TaskSpec) -> Effort:
++    if spec.effort is not Effort.AUTO:
++        return spec.effort
++    if spec.kind in {TaskKind.EXTRACT, TaskKind.INSPECT, TaskKind.SUMMARIZE}:
++        return Effort.LOW
++    if spec.kind in {TaskKind.EXECUTE, TaskKind.EDIT, TaskKind.TEST}:
++        return Effort.MEDIUM
++    return Effort.HIGH
++
++
++def resolve_speed(spec: TaskSpec) -> Speed:
++    if spec.speed is not Speed.AUTO:
++        return spec.speed
++    return Speed.STANDARD
++
++
++def normalize_task_graph(values: Sequence[Mapping[str, Any]]) -> tuple[TaskSpec, ...]:
++    tasks = tuple(
++        TaskSpec.from_dict(value, index=index) for index, value in enumerate(values)
++    )
++    if not tasks:
++        raise ContractError("task graph is empty")
++    by_id: dict[str, TaskSpec] = {}
++    dedupe: dict[str, TaskSpec] = {}
++    for task in tasks:
++        if task.id in by_id:
++            raise ContractError(f"duplicate task id: {task.id}")
++        by_id[task.id] = task
++        if task.dedupe_key:
++            previous = dedupe.get(task.dedupe_key)
++            if previous is not None and stable_json_dumps(
++                previous
++            ) != stable_json_dumps(task):
++                raise ContractError(
++                    f"dedupe_key {task.dedupe_key!r} describes different tasks"
++                )
++            dedupe[task.dedupe_key] = task
++    for task in tasks:
++        for dep in task.depends_on:
++            if dep not in by_id:
++                raise ContractError(f"task {task.id!r} has unknown dependency {dep!r}")
++            if dep == task.id:
++                raise ContractError(f"dependency cycle includes {task.id!r}")
++
++    visiting: set[str] = set()
++    visited: set[str] = set()
++
++    def visit(task_id: str) -> None:
++        if task_id in visited:
++            return
++        if task_id in visiting:
++            raise ContractError(f"dependency cycle includes {task_id!r}")
++        visiting.add(task_id)
++        for dep in by_id[task_id].depends_on:
++            visit(dep)
++        visiting.remove(task_id)
++        visited.add(task_id)
++
++    for task in tasks:
++        visit(task.id)
++
++    def depends_transitively(task_id: str, possible_ancestor: str) -> bool:
++        pending = list(by_id[task_id].depends_on)
++        seen: set[str] = set()
++        while pending:
++            current = pending.pop()
++            if current == possible_ancestor:
++                return True
++            if current not in seen:
++                seen.add(current)
++                pending.extend(by_id[current].depends_on)
++        return False
++
++    for index, left in enumerate(tasks):
++        if not left.write_scope:
++            continue
++        for right in tasks[index + 1 :]:
++            if not right.write_scope or not write_scopes_overlap(
++                left.write_scope, right.write_scope
++            ):
++                continue
++            if not (
++                depends_transitively(left.id, right.id)
++                or depends_transitively(right.id, left.id)
++            ):
++                raise ContractError(
++                    f"tasks {left.id!r} and {right.id!r} have overlapping write scopes without dependency ordering"
++                )
++    return tasks
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 346d22da2e..20e6f98efd 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -1001,3 +1001,8 @@ class LocalEnvironment(BaseEnvironment):
+         for f in (self._snapshot_path, self._cwd_file, *stale):
+             with contextlib.suppress(OSError):
+                 os.unlink(f)
++
++    def execute(self, command: str, cwd: str = "", **kwargs):
++        from agent.delegation_context import authorize_delegated_terminal
++        authorize_delegated_terminal(command, cwd=cwd or self.cwd)
++        return super().execute(command, cwd, **kwargs)
+diff --git a/tools/file_tools.py b/tools/file_tools.py
+index 9e5b745243..258c7544c5 100644
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -16,6 +16,9 @@ import stat
+ import threading
+ import time
+ from contextlib import ExitStack
++from functools import wraps
++from agent.delegation_context import (authorize_delegated_tool, authorize_delegated_write,
++    delegated_file_effect_context, get_delegation_identity, DelegationScopeError)
+ from pathlib import Path
+ 
+ from agent.file_safety import get_nt_namespace_error, get_read_block_error
+@@ -602,6 +605,30 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
+     return count
+ 
+ 
++def _owned_file_effect(tool_name):
++    """Use the existing delegated authority without granting terminal access."""
++    def decorate(function):
++        @wraps(function)
++        def call(*args, **kwargs):
++            try:
++                authorize_delegated_tool(tool_name)
++                with delegated_file_effect_context():
++                    return function(*args, **kwargs)
++            except DelegationScopeError as exc:
++                return tool_error(str(exc))
++        return call
++    return decorate
++
++
++def _authorize_resolved_file_write(resolved):
++    if not get_delegation_identity().run_id:
++        return
++    if not resolved:
++        raise DelegationScopeError("Cannot authorize an unresolved delegated write target")
++    authorize_delegated_write(resolved)
++
++
++@_owned_file_effect("read_file")
+ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str:
+     """Read a file with pagination and line numbers.
+ 
+@@ -858,6 +885,7 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
+     )
+ 
+ 
++@_owned_file_effect("write_file")
+ def write_file_tool(path: str, content: str, task_id: str = "default",
+                     cross_profile: bool = False,
+                     session_id: str | None = None) -> str:
+@@ -883,6 +911,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
+         # Resolution failure falls back to the legacy unlocked path (the write
+         # still proceeds; the per-task staleness check still runs).
+         _resolved = _resolve_or_none(path, task_id)
++        _authorize_resolved_file_write(_resolved)
+         path_to_resolved = {path: _resolved}
+         with ExitStack() as _lock:
+             if _resolved:
+@@ -954,6 +983,7 @@ def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str], list[st
+     return paths, content_paths, entry_paths
+ 
+ 
++@_owned_file_effect("patch")
+ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
+                new_string: str = None, replace_all: bool = False, patch: str = None,
+                task_id: str = "default", cross_profile: bool = False,
+@@ -982,6 +1012,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
+         # the same order). An unresolvable path is simply not locked.
+         _path_to_resolved: dict[str, str] = {_p: _resolve_or_none(_p, task_id) for _p in _paths_to_check}
+         _path_to_entry: dict[str, str] = {_p: _resolve_or_none(_p, task_id, entry=True) for _p in _entry_paths}
++        for _resolved_target in _path_to_resolved.values():
++            _authorize_resolved_file_write(_resolved_target)
+         with ExitStack() as _locks:
+             for _r in sorted({_r for _r in (*_path_to_resolved.values(), *_path_to_entry.values()) if _r}):
+                 _locks.enter_context(file_state.lock_path(_r))
+@@ -1044,6 +1076,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
+         return tool_error(str(e))
+ 
+ 
++@_owned_file_effect("search_files")
+ def search_tool(pattern: str, target: str = "content", path: str = ".",
+                 file_glob: str = None, limit: int = 50, offset: int = 0,
+                 output_mode: str = "content", context: int = 0,
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 6dfeb9739e..9ee22fb3b8 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -2764,6 +2764,11 @@ _MAX_HANDOFFS_PER_CHILD = 3
+ 
+ 
+ def _handle_process(args, **kw):
++    try:
++        from agent.delegation_context import authorize_delegated_tool
++        authorize_delegated_tool("process")
++    except PermissionError as exc:
++        return json.dumps({"status": "blocked", "error": str(exc)})
+     action = args.get("action", "")
+     # Coerce to string — some models send session_id as an integer
+     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index be1496847b..88c71652ff 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1378,6 +1378,8 @@ def terminal_tool(
+         plan = _plan_execution(
+             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
+         )
++        from agent.delegation_context import authorize_delegated_terminal
++        authorize_delegated_terminal(command, cwd=workdir or plan.cwd, background=background)
+         env = _acquire_env(plan, task_id)
+         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
+ 
